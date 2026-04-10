@@ -1,4 +1,0 @@
-sex_id,name,code,dt_inserted,inserted_by,dt_updated,last_updated_by,archived,dt_archived,last_archived_by,dt_restored,last_restored_by,dt_last_modified
-1,MALE,M,2018-07-09 11:46:22,,,,0,,,,,2020-11-06 13:20:08
-2,FEMALE,F,2018-07-09 11:46:31,,,,0,,,,,2020-11-06 13:20:14
-3,NOT ASSIGNED,NA,2022-03-07 08:53:07,,2023-02-17 11:22:13,2,0,2024-06-05 12:44:58,2,2024-06-05 12:45:03,2,2024-06-05 12:44:39

@@ -1,3 +1,6 @@
 {
-    "migrated_tables": []
+    "processed_tables": [],
+    "migrated_tables": [],
+    "pattern": null,
+    "from_list": null
 }

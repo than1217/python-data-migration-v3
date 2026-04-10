@@ -255,6 +255,11 @@ def create_destination_db():
                 cursor = conn.cursor()
                 cursor.execute(f"CREATE DATABASE IF NOT EXISTS {config.DEST_DB_DATABASE} CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci")
                 logger.info("Database '%s' ensured on destination.", config.DEST_DB_DATABASE)
+                try:
+                    cursor.execute("SET GLOBAL local_infile=1")
+                    logger.info("Successfully enabled local_infile on destination server.")
+                except Error as e:
+                    logger.warning("Could not set GLOBAL local_infile=1. It might already be enabled or lack permissions: %s", e)
                 cursor.close()
                 conn.close()
                 return True
@@ -355,6 +360,56 @@ def load_csv_to_dest(target_table_name, csv_file_path):
                 logger.error("Attempt %s/%s unexpected error loading CSV for '%s': %s", attempt, MAX_RETRIES, target_table_name, e)
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY)
+    
+    logger.info("Falling back to Python mysql.connector for table '%s'...", target_table_name)
+    try:
+        conn = mysql.connector.connect(
+            host=config.DEST_DB_HOST,
+            user=config.DEST_DB_USER,
+            password=config.DEST_DB_PASSWORD,
+            database=config.DEST_DB_DATABASE,
+            charset='utf8mb4',
+            connect_timeout=10
+        )
+        if conn.is_connected():
+            cursor = conn.cursor()
+            cursor.execute("SET SESSION sql_mode=''")
+            cursor.execute("SET SESSION FOREIGN_KEY_CHECKS=0")
+            cursor.execute("SET SESSION UNIQUE_CHECKS=0")
+            
+            with open(csv_file_path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                headers = next(reader, None)
+                if not headers:
+                    logger.warning("CSV is empty for table '%s'.", target_table_name)
+                    return True
+                
+                placeholders = ', '.join(['%s'] * len(headers))
+                col_names = ', '.join([f"`{h}`" for h in headers])
+                query = f"INSERT INTO `{target_table_name}` ({col_names}) VALUES ({placeholders})"
+                
+                batch_size = 5000
+                batch = []
+                
+                for row in reader:
+                    # Convert empty strings to None if you want NULLs, but empty strings are fine if columns allow
+                    batch.append(tuple(row))
+                    if len(batch) >= batch_size:
+                        cursor.executemany(query, batch)
+                        conn.commit()
+                        batch = []
+                        
+                if batch:
+                    cursor.executemany(query, batch)
+                    conn.commit()
+                    
+            cursor.close()
+            conn.close()
+            logger.info("Successfully loaded CSV via fallback into '%s'.", target_table_name)
+            return True
+    except Error as e:
+        logger.error("Fallback failed to load CSV for '%s': %s", target_table_name, e)
+        
     return False
 
 def run_migration(tables, state, suffix):

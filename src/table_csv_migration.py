@@ -216,7 +216,6 @@ def export_data_to_csv(table_name, csv_file_path):
             password=config.DB_PASSWORD,
             database=config.DB_DATABASE,
             charset='utf8mb4',
-            collation='utf8mb4_0900_ai_ci',
             connect_timeout=10
         )
         if conn.is_connected():
@@ -576,9 +575,40 @@ def main():
             print("Invalid choice.")
             continue
             
-        if main_choice == '1': suffix = '_v2'
-        elif main_choice == '2': suffix = '_v3'
-        else: suffix = input("Enter custom suffix (e.g., '_v4'): ").strip()
+        if main_choice == '1':
+            suffix = '_v2'
+            servers = {
+                "1": ("10.255.9.100", "PPIS v2 Production"),
+                "2": ("10.255.9.104", "PPIS v2 CMS SWDI Production"),
+                "3": ("10.255.9.105", "PPIS v2 Staging"),
+                "4": ("localhost", "Localhost")
+            }
+        elif main_choice == '2':
+            suffix = '_v3'
+            servers = {
+                "1": ("10.10.10.96", "PPIS v3 Staging"),
+                "2": ("10.255.9.111", "PPIS v3 Slave"),
+                "3": ("localhost", "Localhost")
+            }
+        else:
+            suffix = input("Enter custom suffix (e.g., '_v4'): ").strip()
+            servers = {
+                "1": ("localhost", "Localhost")
+            }
+            
+        print(f"\n--- Select Server for PPIS{suffix.replace('_','')} ---")
+        for key, (ip, name) in servers.items():
+            print(f"{key}. {name} ({ip})")
+        print("0. Enter Custom Server IP")
+
+        srv_choice = input("\nSelect server: ").strip()
+        if srv_choice == '0':
+            config.DB_HOST = input("Enter custom IP: ").strip()
+        elif srv_choice in servers:
+            config.DB_HOST = servers[srv_choice][0]
+        else:
+            print("Invalid selection.")
+            continue
         
         print("\n--- Source Server Authentication ---")
         config.DB_USER = input(f"Username [{config.DB_USER}]: ").strip() or config.DB_USER

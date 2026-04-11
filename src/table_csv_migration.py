@@ -250,7 +250,7 @@ def export_data_to_csv(table_name, csv_file_path):
                     return True
                 
                 # If we have an integer primary key, use chunking (Strategy 2)
-                chunk_size = 50000
+                chunk_size = 200000
                 if pk_col and ('int' in pk_col[1].lower()):
                     pk_name = pk_col[0]
                     cursor.execute(f"SELECT MIN(`{pk_name}`), MAX(`{pk_name}`) FROM `{table_name}`")
@@ -272,7 +272,7 @@ def export_data_to_csv(table_name, csv_file_path):
                     unbuffered_cursor = conn.cursor(buffered=False)
                     unbuffered_cursor.execute(f"SELECT * FROM `{table_name}`")
                     while True:
-                        rows = unbuffered_cursor.fetchmany(10000)
+                        rows = unbuffered_cursor.fetchmany(200000)
                         if not rows:
                             break
                         writer.writerows(rows)

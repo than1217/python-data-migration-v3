@@ -228,7 +228,7 @@ def export_data_to_csv(table_name, csv_file_path):
             cursor = conn.cursor()
             
             # Check for a primary key (integer) to use for chunking
-            cursor.execute(f"SHOW COLUMNS FROM `{table_name}` WHERE Key = 'PRI'")
+            cursor.execute(f"SHOW COLUMNS FROM `{table_name}` WHERE `Key` = 'PRI'")
             pk_col = cursor.fetchone()
             
             # Get total rows for progress bar

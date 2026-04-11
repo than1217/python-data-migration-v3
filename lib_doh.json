@@ -1,0 +1,11 @@
+{
+    "db_host": "localhost",
+    "db_user": "jdfigueroa",
+    "db_database": "pppp",
+    "dest_db_host": "localhost",
+    "dest_db_user": "jdfigueroa",
+    "dest_db_database": "consultant_ods",
+    "suffix": "_v3",
+    "pattern": "^lib_doh$",
+    "resume": false
+}

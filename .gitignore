@@ -5,7 +5,6 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-.env
 # SQL files
 *.sql
 # Data files

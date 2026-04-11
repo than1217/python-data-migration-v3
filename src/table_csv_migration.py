@@ -229,11 +229,13 @@ def export_data_to_csv(table_name, csv_file_path):
             
             # Check for a primary key (integer) to use for chunking
             cursor.execute(f"SHOW COLUMNS FROM `{table_name}` WHERE `Key` = 'PRI'")
-            pk_col = cursor.fetchone()
+            pk_cols = cursor.fetchall()
+            pk_col = pk_cols[0] if pk_cols else None
             
             # Get total rows for progress bar
             cursor.execute(f"SELECT COUNT(*) FROM `{table_name}`")
             total_rows = cursor.fetchone()[0]
+            cursor.fetchall()
 
             with open(csv_file_path, 'w', encoding='utf-8', newline='') as f, tqdm(total=total_rows, desc=f"Exporting CSV {table_name}", unit="row", leave=False) as pbar:
                 writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
@@ -242,6 +244,7 @@ def export_data_to_csv(table_name, csv_file_path):
                 cursor.execute(f"SELECT * FROM `{table_name}` LIMIT 0")
                 if cursor.description:
                     writer.writerow([i[0] for i in cursor.description])
+                cursor.fetchall()
 
                 if total_rows == 0:
                     cursor.close()
@@ -255,6 +258,7 @@ def export_data_to_csv(table_name, csv_file_path):
                     pk_name = pk_col[0]
                     cursor.execute(f"SELECT MIN(`{pk_name}`), MAX(`{pk_name}`) FROM `{table_name}`")
                     min_id, max_id = cursor.fetchone()
+                    cursor.fetchall()
                     
                     if min_id is not None and max_id is not None:
                         current_id = min_id

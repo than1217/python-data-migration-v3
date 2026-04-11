@@ -638,6 +638,57 @@ def migration_menu(suffix):
             break
 
 def main():
+    parser = argparse.ArgumentParser(description="Python CSV Data Migration Utility")
+    parser.add_argument('--headless', type=str, help='Path to JSON configuration file for headless execution')
+    args = parser.parse_args()
+
+    if args.headless:
+        logger.info("Running in headless mode using config file: %s", args.headless)
+        if not os.path.exists(args.headless):
+            print(f"Error: Config file '{args.headless}' not found.")
+            logger.error("Headless config file not found: %s", args.headless)
+            sys.exit(1)
+            
+        try:
+            with open(args.headless, 'r') as f:
+                headless_config = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"Error parsing JSON file: {e}")
+            logger.error("Headless JSON parsing error: %s", e)
+            sys.exit(1)
+
+        # Override config variables if provided in JSON
+        if 'db_host' in headless_config: config.DB_HOST = headless_config['db_host']
+        if 'db_database' in headless_config: config.DB_DATABASE = headless_config['db_database']
+        if 'db_user' in headless_config: config.DB_USER = headless_config['db_user']
+        if 'dest_db_host' in headless_config: config.DEST_DB_HOST = headless_config['dest_db_host']
+        if 'dest_db_database' in headless_config: config.DEST_DB_DATABASE = headless_config['dest_db_database']
+        if 'dest_db_user' in headless_config: config.DEST_DB_USER = headless_config['dest_db_user']
+
+        # Passwords are read from .env via config.py (DB_PASSWORD, DEST_DB_PASSWORD)
+        
+        suffix = headless_config.get('suffix', '_v2')
+        pattern = headless_config.get('pattern', None)
+        from_list = headless_config.get('tables', None)
+
+        print(f"\n--- HEADLESS MIGRATION ---")
+        print(f"Source: {config.DB_HOST} -> {config.DB_DATABASE}")
+        print(f"Target: {config.DEST_DB_HOST} -> {config.DEST_DB_DATABASE}")
+        print(f"Suffix: {suffix}")
+        
+        state = {"migrated_tables": []}
+        save_state(state)
+        
+        if pattern:
+            tables = get_lib_tables(pattern=pattern)
+        elif from_list:
+            tables = get_lib_tables(from_list=from_list)
+        else:
+            tables = get_lib_tables(pattern=r'^lib_.*')
+            
+        run_migration(tables, state, suffix)
+        sys.exit(0)
+
     while True:
         print("\n=============================================")
         print("    PYTHON CSV DATA MIGRATION UTILITY        ")

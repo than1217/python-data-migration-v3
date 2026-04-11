@@ -11,10 +11,11 @@ This utility is a spin-off of the original Python Data Migration utility. Rather
 ## Project Structure
 ```text
 csv-data-migration/
+├── .env                  # Environment variables for credentials
 ├── requirements.txt
 └── src/
-    ├── config.py         # Database connection info and executable paths
-    └── csv_migration.py  # Main execution script
+    ├── config.py             # Database connection info and executable paths
+    └── table_csv_migration.py # Main execution script
 ```
 
 ## Setup
@@ -26,8 +27,41 @@ csv-data-migration/
 4. Update `src/config.py` with default database connection details or create a `.env` file.
 
 ## Usage
+
+### Interactive Mode
 Run the interactive console application:
 ```bash
-python src/csv_migration.py
+python src/table_csv_migration.py
 ```
 Follow the prompts to connect to the source and destination databases and select table patterns or exact lists to migrate.
+
+### Headless Mode
+You can automate migrations by passing a JSON configuration file via the `--headless` flag. This avoids all interactive prompts. Passwords (`DB_PASSWORD`, `DEST_DB_PASSWORD`) will be securely read from your `.env` file.
+
+```bash
+python src/table_csv_migration.py --headless config.json
+```
+
+**Example `config.json` using a regex pattern:**
+```json
+{
+  "suffix": "_v3",
+  "db_host": "10.10.10.96",
+  "db_database": "source_db_name",
+  "dest_db_host": "10.10.10.133",
+  "dest_db_database": "dest_db_name",
+  "pattern": "^lib_.*"
+}
+```
+
+**Example `config.json` using an exact list of tables:**
+```json
+{
+  "suffix": "_v2",
+  "db_host": "127.0.0.1",
+  "db_database": "source_db_name",
+  "dest_db_host": "127.0.0.1",
+  "dest_db_database": "dest_db_name",
+  "tables": ["lib_users", "lib_address"]
+}
+```

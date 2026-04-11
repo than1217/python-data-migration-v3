@@ -1,0 +1,11 @@
+{
+    "db_host": "10.255.9.100",
+    "db_user": "jfiguero",
+    "db_database": "pppp",
+    "dest_db_host": "10.10.10.133",
+    "dest_db_user": "jfiguero",
+    "dest_db_database": "consultant_ods",
+    "suffix": "_v2",
+    "pattern": "^tbl_payroll_transaction_log$",
+    "resume": false
+}

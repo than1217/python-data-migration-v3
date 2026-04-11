@@ -89,6 +89,11 @@ def get_lib_tables(pattern=None, from_list=None):
         except Error as e:
             logger.error("Attempt %s/%s - Error connecting to MySQL: %s", attempt, MAX_RETRIES, e)
             print(f"Attempt {attempt}/{MAX_RETRIES} - Error connecting to MySQL: {e}")
+            if e.errno == 2002 and config.DB_HOST.lower() == 'localhost':
+                logger.warning("Socket connection failed. Falling back to TCP/IP via 127.0.0.1")
+                print("Socket connection failed. Falling back to TCP/IP via 127.0.0.1")
+                config.DB_HOST = '127.0.0.1'
+                
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
     return []
@@ -238,6 +243,11 @@ def export_data_to_csv(table_name, csv_file_path):
             logger.info("Successfully exported data from '%s' to CSV.", table_name)
             return True
     except Error as e:
+        if e.errno == 2002 and config.DB_HOST.lower() == 'localhost':
+            logger.warning("Socket connection failed during CSV export. Falling back to TCP/IP via 127.0.0.1 for '%s'", table_name)
+            config.DB_HOST = '127.0.0.1'
+            return export_data_to_csv(table_name, csv_file_path)
+            
         logger.error("Error exporting to CSV for table '%s': %s", table_name, e)
     return False
 
@@ -265,6 +275,10 @@ def create_destination_db():
                 return True
         except Error as e:
             logger.error("Attempt %s/%s - Error creating destination DB: %s", attempt, MAX_RETRIES, e)
+            if e.errno == 2002 and config.DEST_DB_HOST.lower() == 'localhost':
+                logger.warning("Socket connection failed for destination DB creation. Falling back to TCP/IP via 127.0.0.1")
+                config.DEST_DB_HOST = '127.0.0.1'
+                
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
     return False
@@ -529,6 +543,12 @@ def choose_database():
                 else:
                     print("Invalid choice.")
     except Error as e:
+        if e.errno == 2002 and config.DB_HOST.lower() == 'localhost':
+            print("\nSocket connection failed. Falling back to TCP/IP via 127.0.0.1...")
+            logger.warning("Socket connection failed. Falling back to TCP/IP via 127.0.0.1 for initial DB fetch.")
+            config.DB_HOST = '127.0.0.1'
+            return choose_database()
+            
         print(f"\nAuthentication or connection failed: {e}")
         return False
 
@@ -568,6 +588,12 @@ def choose_destination_database():
                 else:
                     print("Invalid choice.")
     except Error as e:
+        if e.errno == 2002 and config.DEST_DB_HOST.lower() == 'localhost':
+            print("\nSocket connection failed for destination. Falling back to TCP/IP via 127.0.0.1...")
+            logger.warning("Socket connection failed for destination. Falling back to TCP/IP via 127.0.0.1.")
+            config.DEST_DB_HOST = '127.0.0.1'
+            return choose_destination_database()
+            
         print(f"\nAuthentication failed for destination server: {e}")
         manual_db = input("Enter destination database name manually: ").strip()
         if manual_db:

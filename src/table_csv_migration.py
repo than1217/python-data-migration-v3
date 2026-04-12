@@ -253,36 +253,19 @@ def export_data_to_csv(table_name, csv_file_path):
                     logger.info("Table '%s' is empty. Exported headers only.", table_name)
                     return True
                 
-                # If we have an integer primary key, use chunking (Strategy 2)
-                chunk_size = 200000
-                if pk_col and ('int' in pk_col[1].lower()):
-                    pk_name = pk_col[0]
-                    cursor.execute(f"SELECT MIN(`{pk_name}`), MAX(`{pk_name}`) FROM `{table_name}`")
-                    min_id, max_id = cursor.fetchone()
-                    cursor.fetchall()
-                    
-                    if min_id is not None and max_id is not None:
-                        current_id = min_id
-                        while current_id <= max_id:
-                            next_id = current_id + chunk_size
-                            cursor.execute(f"SELECT * FROM `{table_name}` WHERE `{pk_name}` >= %s AND `{pk_name}` < %s", (current_id, next_id))
-                            rows = cursor.fetchall()
-                            if rows:
-                                writer.writerows(rows)
-                                pbar.update(len(rows))
-                            current_id = next_id
+                # Use server-side cursor (unbuffered) for streaming directly
+                unbuffered_cursor = conn.cursor(buffered=False)
+                unbuffered_cursor.execute(f"SELECT * FROM `{table_name}`")
                 
-                # Fallback if no suitable primary key: standard fetchmany with unbuffered cursor
-                else:
-                    unbuffered_cursor = conn.cursor(buffered=False)
-                    unbuffered_cursor.execute(f"SELECT * FROM `{table_name}`")
-                    while True:
-                        rows = unbuffered_cursor.fetchmany(200000)
-                        if not rows:
-                            break
-                        writer.writerows(rows)
-                        pbar.update(len(rows))
-                    unbuffered_cursor.close()
+                batch_size = 10000
+                while True:
+                    rows = unbuffered_cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    writer.writerows(rows)
+                    pbar.update(len(rows))
+                
+                unbuffered_cursor.close()
                     
             cursor.close()
             conn.close()

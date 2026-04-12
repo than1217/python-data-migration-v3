@@ -8,6 +8,7 @@ import sys
 import getpass
 import argparse
 import csv
+import threading
 import mysql.connector
 from tqdm import tqdm
 from mysql.connector import Error
@@ -399,13 +400,59 @@ def load_csv_to_dest(target_table_name, csv_file_path):
     IGNORE 1 LINES;
     """
     
+    # Try to get total rows for the progress bar
+    try:
+        with open(csv_file_path, 'rb') as f:
+            total_rows = max(0, sum(1 for _ in f) - 1)
+    except:
+        total_rows = 0
+
+    def progress_monitor(stop_event, pbar):
+        try:
+            conn = mysql.connector.connect(
+                host=config.DEST_DB_HOST, user=config.DEST_DB_USER,
+                password=config.DEST_DB_PASSWORD, database=config.DEST_DB_DATABASE, connect_timeout=5
+            )
+            if conn.is_connected():
+                cursor = conn.cursor()
+                cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
+                last_count = 0
+                while not stop_event.is_set():
+                    time.sleep(0.5)
+                    try:
+                        cursor.execute(f"SELECT COUNT(*) FROM `{target_table_name}`")
+                        current_count = int(cursor.fetchone()[0])
+                        added = current_count - last_count
+                        if added > 0:
+                            pbar.update(added)
+                            last_count = current_count
+                    except:
+                        pass
+                cursor.close()
+                conn.close()
+        except:
+            pass
+
     import tempfile
     t_start = time.time()
     for attempt in range(1, MAX_RETRIES + 1):
         with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as err_file:
             try:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err_file, text=True)
+                
+                stop_event = threading.Event()
+                pbar = tqdm(total=total_rows, desc=f"Loading CSV {target_table_name}", unit="row", leave=False)
+                monitor_thread = threading.Thread(target=progress_monitor, args=(stop_event, pbar))
+                monitor_thread.daemon = True
+                monitor_thread.start()
+                
                 process.communicate(sql_command)
+                
+                stop_event.set()
+                monitor_thread.join(timeout=1)
+                pbar.n = total_rows
+                pbar.refresh()
+                pbar.close()
                 
                 if process.returncode == 0:
                     logger.info("Successfully loaded CSV into '%s' in %s.", target_table_name, format_time(time.time() - t_start))
@@ -450,17 +497,20 @@ def load_csv_to_dest(target_table_name, csv_file_path):
                 batch_size = 5000
                 batch = []
                 
-                for row in reader:
-                    # Convert empty strings to None if you want NULLs, but empty strings are fine if columns allow
-                    batch.append(tuple(row))
-                    if len(batch) >= batch_size:
+                with tqdm(total=total_rows, desc=f"Loading CSV {target_table_name} (Fallback)", unit="row", leave=False) as pbar:
+                    for row in reader:
+                        # Convert empty strings to None if you want NULLs, but empty strings are fine if columns allow
+                        batch.append(tuple(row))
+                        if len(batch) >= batch_size:
+                            cursor.executemany(query, batch)
+                            conn.commit()
+                            batch = []
+                            pbar.update(batch_size)
+                            
+                    if batch:
                         cursor.executemany(query, batch)
                         conn.commit()
-                        batch = []
-                        
-                if batch:
-                    cursor.executemany(query, batch)
-                    conn.commit()
+                        pbar.update(len(batch))
                     
             cursor.close()
             conn.close()

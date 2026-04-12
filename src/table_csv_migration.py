@@ -533,6 +533,18 @@ def run_migration(tables, state, suffix):
     os.makedirs(processed_dir, exist_ok=True)
     os.makedirs(csv_dir, exist_ok=True)
 
+    summary_csv_path = os.path.join(project_dir, "output", f"migration_summary_{folder_name}.csv")
+    summary_data = []
+
+    def get_ddl_content(filepath):
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    return f.read().strip()
+            except Exception:
+                pass
+        return ""
+
     if not tables:
         print("No tables found to migrate.")
         return
@@ -559,10 +571,13 @@ def run_migration(tables, state, suffix):
         
         if table in state.get("migrated_tables", []):
             logger.info("Skipping '%s', already migrated in previous session.", table)
+            ddl_content = get_ddl_content(processed_schema)
+            summary_data.append([target_table_name, "Skipped", ddl_content, "Success (Already migrated)"])
             continue
             
         t_start = time.time()
         
+        remarks = "Success"
         # 1. Dump raw schema
         if run_mysqldump_schema(table, raw_schema):
             # 2. Process schema (and delete raw)
@@ -573,26 +588,46 @@ def run_migration(tables, state, suffix):
                     if load_sql_schema(processed_schema):
                         # 5. Load CSV to destination DB
                         if load_csv_to_dest(target_table_name, csv_file):
-                            logger.info("Total migration for table '%s' completed in %s.", table, format_time(time.time() - t_start))
+                            elapsed = format_time(time.time() - t_start)
+                            logger.info("Total migration for table '%s' completed in %s.", table, elapsed)
                             successful_migrations += 1
                             if "migrated_tables" not in state:
                                 state["migrated_tables"] = []
                             state["migrated_tables"].append(table)
                             save_state(state)
                         else:
+                            remarks = "Failed: Load CSV to destination"
                             logger.warning("Failed to load CSV to destination for table '%s'.", table)
                     else:
+                        remarks = "Failed: Execute schema in destination"
                         logger.warning("Failed to execute schema in destination for table '%s'.", table)
                 else:
+                    remarks = "Failed: Export data to CSV"
                     logger.warning("Failed to export CSV for table '%s'.", table)
             else:
+                remarks = "Failed: Process schema file"
                 logger.warning("Failed to process schema for table '%s'.", table)
         else:
+            remarks = "Failed: Dump schema"
             logger.warning("Failed to dump schema for table '%s'.", table)
+            
+        elapsed = format_time(time.time() - t_start)
+        ddl_content = get_ddl_content(processed_schema)
+        summary_data.append([target_table_name, elapsed, ddl_content, remarks])
             
     summary = f"Migration complete: {successful_migrations}/{len(tables)} tables migrated."
     print(f"\n{summary}")
     logger.info(summary)
+    
+    # Write summary CSV
+    try:
+        with open(summary_csv_path, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['table_name', 'total_migration', 'ddl_sql', 'remarks'])
+            writer.writerows(summary_data)
+        logger.info("Summary CSV successfully generated at '%s'", summary_csv_path)
+    except Exception as e:
+        logger.error("Failed to write summary CSV: %s", e)
     
     if successful_migrations == len(tables):
         logger.info("All tables migrated successfully. Resetting migration state.")

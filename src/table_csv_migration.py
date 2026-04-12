@@ -585,8 +585,17 @@ def run_migration(tables, state, suffix):
         if run_mysqldump_schema(table, raw_schema):
             # 2. Process schema (and delete raw)
             if process_schema_file(raw_schema, processed_schema, table, suffix):
-                # 3. Export data as CSV
-                if export_data_to_csv(table, csv_file):
+                # 3. Export data as CSV or use existing
+                use_existing = False
+                if os.path.exists(csv_file):
+                    choice = input(f"\nExisting CSV file found for '{table}'. Skip extraction and use existing? (y/n): ").strip().lower()
+                    if choice == 'y':
+                        logger.info("User chose to use existing CSV for '%s'. Skipping extraction.", table)
+                        use_existing = True
+                    else:
+                        logger.info("User chose to re-extract CSV for '%s'.", table)
+                    
+                if use_existing or export_data_to_csv(table, csv_file):
                     # 4. Load Schema to destination DB
                     if load_sql_schema(processed_schema):
                         # 5. Load CSV to destination DB

@@ -569,10 +569,30 @@ def run_migration(tables, state, suffix):
         processed_schema = os.path.join(processed_dir, f"{target_table_name}_schema.sql")
         csv_file = os.path.join(csv_dir, f"{target_table_name}.csv")
         
+        # Determine total rows for summary (requires DB connection or counting CSV)
+        total_rows_migrated = 0
+        def get_total_rows(table_name):
+            try:
+                conn = mysql.connector.connect(
+                    host=config.DEST_DB_HOST, user=config.DEST_DB_USER,
+                    password=config.DEST_DB_PASSWORD, database=config.DEST_DB_DATABASE, connect_timeout=5
+                )
+                if conn.is_connected():
+                    cursor = conn.cursor()
+                    cursor.execute(f"SELECT COUNT(*) FROM `{table_name}`")
+                    count = int(cursor.fetchone()[0])
+                    cursor.close()
+                    conn.close()
+                    return count
+            except:
+                pass
+            return 0
+
         if table in state.get("migrated_tables", []):
             logger.info("Skipping '%s', already migrated in previous session.", table)
             ddl_content = get_ddl_content(processed_schema)
-            summary_data.append([target_table_name, "Skipped", ddl_content, "Success (Already migrated)"])
+            total_rows_migrated = get_total_rows(target_table_name)
+            summary_data.append([target_table_name, "Skipped", ddl_content, total_rows_migrated, "Success (Already migrated)"])
             continue
             
         t_start = time.time()
@@ -613,7 +633,12 @@ def run_migration(tables, state, suffix):
             
         elapsed = format_time(time.time() - t_start)
         ddl_content = get_ddl_content(processed_schema)
-        summary_data.append([target_table_name, elapsed, ddl_content, remarks])
+        
+        # If successfully loaded or already partially loaded, count rows in destination
+        if "Success" in remarks:
+            total_rows_migrated = get_total_rows(target_table_name)
+            
+        summary_data.append([target_table_name, elapsed, ddl_content, total_rows_migrated, remarks])
             
     summary = f"Migration complete: {successful_migrations}/{len(tables)} tables migrated."
     print(f"\n{summary}")
@@ -623,7 +648,7 @@ def run_migration(tables, state, suffix):
     try:
         with open(summary_csv_path, 'w', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['table_name', 'total_migration', 'ddl_sql', 'remarks'])
+            writer.writerow(['table_name', 'total_migration', 'ddl_sql', 'total_rows', 'remarks'])
             writer.writerows(summary_data)
         logger.info("Summary CSV successfully generated at '%s'", summary_csv_path)
     except Exception as e:

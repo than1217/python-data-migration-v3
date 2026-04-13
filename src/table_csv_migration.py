@@ -349,8 +349,7 @@ def load_sql_schema(filepath):
                     time.sleep(RETRY_DELAY)
     return False
 
-def load_csv_to_dest(target_table_name, csv_file_path):
-    """Uses LOAD DATA LOCAL INFILE to bulk load the CSV data into the destination table."""
+def _execute_load_data_infile(target_table_name, csv_file_path):
     command = [
         config.MYSQL_PATH,
         "--local-infile=1",
@@ -365,10 +364,8 @@ def load_csv_to_dest(target_table_name, csv_file_path):
         f"-u{config.DEST_DB_USER}", f"--password={config.DEST_DB_PASSWORD}", config.DEST_DB_DATABASE
     ])
 
-    logger.info("Loading CSV into destination table '%s'...", target_table_name)
     mysql_csv_path = csv_file_path.replace('\\', '/')
     
-    # Matching Python csv module's default export formatting exactly
     sql_command = f"""
     SET SESSION sql_mode='';
     SET SESSION FOREIGN_KEY_CHECKS=0;
@@ -383,74 +380,27 @@ def load_csv_to_dest(target_table_name, csv_file_path):
     IGNORE 1 LINES;
     """
     
-    # Try to get total rows for the progress bar
-    try:
-        with open(csv_file_path, 'rb') as f:
-            total_rows = max(0, sum(1 for _ in f) - 1)
-    except:
-        total_rows = 0
-
-    def progress_monitor(stop_event, pbar):
-        try:
-            conn = mysql.connector.connect(
-                host=config.DEST_DB_HOST, user=config.DEST_DB_USER,
-                password=config.DEST_DB_PASSWORD, database=config.DEST_DB_DATABASE, connect_timeout=5
-            )
-            if conn.is_connected():
-                cursor = conn.cursor()
-                cursor.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
-                last_count = 0
-                while not stop_event.is_set():
-                    time.sleep(0.5)
-                    try:
-                        cursor.execute(f"SELECT COUNT(*) FROM `{target_table_name}`")
-                        current_count = int(cursor.fetchone()[0])
-                        added = current_count - last_count
-                        if added > 0:
-                            pbar.update(added)
-                            last_count = current_count
-                    except:
-                        pass
-                cursor.close()
-                conn.close()
-        except:
-            pass
-
     import tempfile
-    t_start = time.time()
     for attempt in range(1, MAX_RETRIES + 1):
         with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as err_file:
             try:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err_file, text=True)
-                
-                stop_event = threading.Event()
-                pbar = tqdm(total=total_rows, desc=f"Loading CSV {target_table_name}", unit="row", leave=False)
-                monitor_thread = threading.Thread(target=progress_monitor, args=(stop_event, pbar))
-                monitor_thread.daemon = True
-                monitor_thread.start()
-                
                 process.communicate(sql_command)
                 
-                stop_event.set()
-                monitor_thread.join(timeout=1)
-                pbar.n = total_rows
-                pbar.refresh()
-                pbar.close()
-                
                 if process.returncode == 0:
-                    logger.info("Successfully loaded CSV into '%s' in %s.", target_table_name, format_time(time.time() - t_start))
                     return True
                 else:
                     err_file.seek(0)
-                    logger.error("Attempt %s/%s failed to load CSV for '%s': %s", attempt, MAX_RETRIES, target_table_name, err_file.read())
+                    logger.error("Attempt %s/%s failed to load chunk CSV for '%s': %s", attempt, MAX_RETRIES, target_table_name, err_file.read())
                     if attempt < MAX_RETRIES:
                         time.sleep(RETRY_DELAY)
             except Exception as e:
-                logger.error("Attempt %s/%s unexpected error loading CSV for '%s': %s", attempt, MAX_RETRIES, target_table_name, e)
+                logger.error("Attempt %s/%s unexpected error loading chunk CSV for '%s': %s", attempt, MAX_RETRIES, target_table_name, e)
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY)
-    
-    logger.info("Falling back to Python mysql.connector for table '%s'...", target_table_name)
+    return False
+
+def _execute_fallback_insert(target_table_name, headers, rows):
     try:
         conn = mysql.connector.connect(
             host=config.DEST_DB_HOST,
@@ -466,43 +416,99 @@ def load_csv_to_dest(target_table_name, csv_file_path):
             cursor.execute("SET SESSION FOREIGN_KEY_CHECKS=0")
             cursor.execute("SET SESSION UNIQUE_CHECKS=0")
             
-            with open(csv_file_path, 'r', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                headers = next(reader, None)
-                if not headers:
-                    logger.warning("CSV is empty for table '%s'.", target_table_name)
-                    return True
-                
-                placeholders = ', '.join(['%s'] * len(headers))
-                col_names = ', '.join([f"`{h}`" for h in headers])
-                query = f"INSERT INTO `{target_table_name}` ({col_names}) VALUES ({placeholders})"
-                
-                batch_size = 5000
-                batch = []
-                
-                with tqdm(total=total_rows, desc=f"Loading CSV {target_table_name} (Fallback)", unit="row", leave=False) as pbar:
-                    for row in reader:
-                        # Convert empty strings to None if you want NULLs, but empty strings are fine if columns allow
-                        batch.append(tuple(row))
-                        if len(batch) >= batch_size:
-                            cursor.executemany(query, batch)
-                            conn.commit()
-                            batch = []
-                            pbar.update(batch_size)
-                            
-                    if batch:
-                        cursor.executemany(query, batch)
-                        conn.commit()
-                        pbar.update(len(batch))
+            placeholders = ', '.join(['%s'] * len(headers))
+            col_names = ', '.join([f"`{h}`" for h in headers])
+            query = f"INSERT INTO `{target_table_name}` ({col_names}) VALUES ({placeholders})"
+            
+            batch_size = 5000
+            batch = []
+            for row in rows:
+                batch.append(tuple(row))
+                if len(batch) >= batch_size:
+                    cursor.executemany(query, batch)
+                    conn.commit()
+                    batch = []
+                    
+            if batch:
+                cursor.executemany(query, batch)
+                conn.commit()
                     
             cursor.close()
             conn.close()
-            logger.info("Successfully loaded CSV via fallback into '%s'.", target_table_name)
             return True
     except Error as e:
-        logger.error("Fallback failed to load CSV for '%s': %s", target_table_name, e)
-        
+        logger.error("Fallback failed to load CSV chunk for '%s': %s", target_table_name, e)
     return False
+
+def load_csv_to_dest(target_table_name, csv_file_path, state):
+    """Uses LOAD DATA LOCAL INFILE to bulk load the CSV data into the destination table in chunks."""
+    logger.info("Loading CSV into destination table '%s' in chunks...", target_table_name)
+    
+    chunk_size = 250000
+    state.setdefault("chunk_progress", {})
+    last_chunk_loaded = state["chunk_progress"].get(target_table_name, -1)
+    
+    try:
+        with open(csv_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            total_rows = max(0, sum(1 for _ in f) - 1)
+    except:
+        total_rows = 0
+
+    t_start = time.time()
+    temp_csv = f"{csv_file_path}.chunk.tmp"
+    
+    with open(csv_file_path, 'r', encoding='utf-8', newline='') as f:
+        reader = csv.reader(f)
+        headers = next(reader, None)
+        if not headers:
+            logger.warning("CSV is empty for table '%s'.", target_table_name)
+            return True
+            
+        chunk_idx = 0
+        with tqdm(total=total_rows, desc=f"Loading CSV {target_table_name}", unit="row", leave=False) as pbar:
+            while True:
+                chunk_rows = []
+                for _ in range(chunk_size):
+                    try:
+                        chunk_rows.append(next(reader))
+                    except StopIteration:
+                        break
+                        
+                if not chunk_rows:
+                    break
+                    
+                if chunk_idx <= last_chunk_loaded:
+                    pbar.update(len(chunk_rows))
+                    chunk_idx += 1
+                    continue
+                    
+                with open(temp_csv, 'w', encoding='utf-8', newline='') as tf:
+                    writer = csv.writer(tf, quoting=csv.QUOTE_MINIMAL)
+                    writer.writerow(headers)
+                    writer.writerows(chunk_rows)
+                    
+                success = _execute_load_data_infile(target_table_name, temp_csv)
+                if not success:
+                    logger.info("Falling back to Python mysql.connector for chunk %s of '%s'...", chunk_idx, target_table_name)
+                    success = _execute_fallback_insert(target_table_name, headers, chunk_rows)
+                    
+                if not success:
+                    logger.error("Failed to load chunk %s for table '%s'.", chunk_idx, target_table_name)
+                    if os.path.exists(temp_csv):
+                        os.remove(temp_csv)
+                    return False
+                    
+                state["chunk_progress"][target_table_name] = chunk_idx
+                save_state(state)
+                
+                pbar.update(len(chunk_rows))
+                chunk_idx += 1
+
+    if os.path.exists(temp_csv):
+        os.remove(temp_csv)
+        
+    logger.info("Successfully loaded CSV into '%s' in %s.", target_table_name, format_time(time.time() - t_start))
+    return True
 
 def run_migration(tables, state, suffix):
     folder_name = suffix.strip('_') if suffix else 'v2'
@@ -580,48 +586,79 @@ def run_migration(tables, state, suffix):
             
         t_start = time.time()
         
+        chunk_progress = state.get("chunk_progress", {}).get(target_table_name, -1)
+        is_resuming = chunk_progress > -1
         remarks = "Success"
-        # 1. Dump raw schema
-        if run_mysqldump_schema(table, raw_schema):
-            # 2. Process schema (and delete raw)
-            if process_schema_file(raw_schema, processed_schema, table, suffix):
-                # 3. Export data as CSV or use existing
-                use_existing = False
-                if os.path.exists(csv_file):
-                    choice = input(f"\nExisting CSV file found for '{table}'. Skip extraction and use existing? (y/n): ").strip().lower()
-                    if choice == 'y':
-                        logger.info("User chose to use existing CSV for '%s'. Skipping extraction.", table)
-                        use_existing = True
-                    else:
-                        logger.info("User chose to re-extract CSV for '%s'.", table)
-                    
-                if use_existing or export_data_to_csv(table, csv_file):
-                    # 4. Load Schema to destination DB
-                    if load_sql_schema(processed_schema):
-                        # 5. Load CSV to destination DB
-                        if load_csv_to_dest(target_table_name, csv_file):
-                            elapsed = format_time(time.time() - t_start)
-                            logger.info("Total migration for table '%s' completed in %s.", table, elapsed)
-                            successful_migrations += 1
-                            if "migrated_tables" not in state:
-                                state["migrated_tables"] = []
-                            state["migrated_tables"].append(table)
-                            save_state(state)
-                        else:
-                            remarks = "Failed: Load CSV to destination"
-                            logger.warning("Failed to load CSV to destination for table '%s'.", table)
-                    else:
-                        remarks = "Failed: Execute schema in destination"
-                        logger.warning("Failed to execute schema in destination for table '%s'.", table)
+        
+        if is_resuming:
+            logger.info("Resuming table '%s' from chunk %s...", table, chunk_progress + 1)
+            use_existing = False
+            if os.path.exists(csv_file):
+                logger.info("Using existing CSV file for resuming '%s'.", table)
+                use_existing = True
+            
+            if use_existing or export_data_to_csv(table, csv_file):
+                # Skip schema drop/create, go straight to appending CSV data
+                if load_csv_to_dest(target_table_name, csv_file, state):
+                    elapsed = format_time(time.time() - t_start)
+                    logger.info("Total migration for table '%s' completed in %s.", table, elapsed)
+                    successful_migrations += 1
+                    if "migrated_tables" not in state:
+                        state["migrated_tables"] = []
+                    state["migrated_tables"].append(table)
+                    if target_table_name in state.get("chunk_progress", {}):
+                        del state["chunk_progress"][target_table_name]
+                    save_state(state)
                 else:
-                    remarks = "Failed: Export data to CSV"
-                    logger.warning("Failed to export CSV for table '%s'.", table)
+                    remarks = "Failed: Load CSV to destination (Resume)"
+                    logger.warning("Failed to load CSV to destination for table '%s'.", table)
             else:
-                remarks = "Failed: Process schema file"
-                logger.warning("Failed to process schema for table '%s'.", table)
+                remarks = "Failed: Export data to CSV (Resume)"
+                logger.warning("Failed to export CSV for table '%s'.", table)
         else:
-            remarks = "Failed: Dump schema"
-            logger.warning("Failed to dump schema for table '%s'.", table)
+            # 1. Dump raw schema
+            if run_mysqldump_schema(table, raw_schema):
+                # 2. Process schema (and delete raw)
+                if process_schema_file(raw_schema, processed_schema, table, suffix):
+                    # 3. Export data as CSV or use existing
+                    use_existing = False
+                    if os.path.exists(csv_file):
+                        choice = input(f"\nExisting CSV file found for '{table}'. Skip extraction and use existing? (y/n): ").strip().lower()
+                        if choice == 'y':
+                            logger.info("User chose to use existing CSV for '%s'. Skipping extraction.", table)
+                            use_existing = True
+                        else:
+                            logger.info("User chose to re-extract CSV for '%s'.", table)
+                        
+                    if use_existing or export_data_to_csv(table, csv_file):
+                        # 4. Load Schema to destination DB
+                        if load_sql_schema(processed_schema):
+                            # 5. Load CSV to destination DB
+                            if load_csv_to_dest(target_table_name, csv_file, state):
+                                elapsed = format_time(time.time() - t_start)
+                                logger.info("Total migration for table '%s' completed in %s.", table, elapsed)
+                                successful_migrations += 1
+                                if "migrated_tables" not in state:
+                                    state["migrated_tables"] = []
+                                state["migrated_tables"].append(table)
+                                if target_table_name in state.get("chunk_progress", {}):
+                                    del state["chunk_progress"][target_table_name]
+                                save_state(state)
+                            else:
+                                remarks = "Failed: Load CSV to destination"
+                                logger.warning("Failed to load CSV to destination for table '%s'.", table)
+                        else:
+                            remarks = "Failed: Execute schema in destination"
+                            logger.warning("Failed to execute schema in destination for table '%s'.", table)
+                    else:
+                        remarks = "Failed: Export data to CSV"
+                        logger.warning("Failed to export CSV for table '%s'.", table)
+                else:
+                    remarks = "Failed: Process schema file"
+                    logger.warning("Failed to process schema for table '%s'.", table)
+            else:
+                remarks = "Failed: Dump schema"
+                logger.warning("Failed to dump schema for table '%s'.", table)
             
         elapsed = format_time(time.time() - t_start)
         ddl_content = get_ddl_content(processed_schema)

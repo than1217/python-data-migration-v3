@@ -233,10 +233,17 @@ def export_data_to_csv(table_name, csv_file_path):
             pk_cols = cursor.fetchall()
             pk_col = pk_cols[0] if pk_cols else None
             
-            # Get total rows for progress bar
-            cursor.execute(f"SELECT COUNT(*) FROM `{table_name}`")
-            total_rows = cursor.fetchone()[0]
+            # Get total rows for progress bar (use approximate count for speed)
+            cursor.execute(f"SELECT TABLE_ROWS FROM information_schema.tables WHERE table_schema = '{config.DB_DATABASE}' AND table_name = '{table_name}'")
+            row = cursor.fetchone()
+            total_rows = int(row[0]) if row and row[0] is not None else 0
             cursor.fetchall()
+
+            # Fallback to COUNT(*) if the table is empty according to stats, to be sure
+            if total_rows == 0:
+                cursor.execute(f"SELECT COUNT(*) FROM `{table_name}`")
+                total_rows = cursor.fetchone()[0]
+                cursor.fetchall()
 
             with open(csv_file_path, 'w', encoding='utf-8', newline='') as f, tqdm(total=total_rows, desc=f"Exporting CSV {table_name}", unit="row", leave=False) as pbar:
                 writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
@@ -251,18 +258,20 @@ def export_data_to_csv(table_name, csv_file_path):
                     cursor.close()
                     conn.close()
                     logger.info("Table '%s' is empty. Exported headers only.", table_name)
-                    return True
+                    return True, 0
                 
                 # Use server-side cursor (unbuffered) for streaming directly
                 unbuffered_cursor = conn.cursor(buffered=False)
                 unbuffered_cursor.execute(f"SELECT * FROM `{table_name}`")
                 
                 batch_size = 10000
+                exact_row_count = 0
                 while True:
                     rows = unbuffered_cursor.fetchmany(batch_size)
                     if not rows:
                         break
                     writer.writerows(rows)
+                    exact_row_count += len(rows)
                     pbar.update(len(rows))
                 
                 unbuffered_cursor.close()
@@ -270,7 +279,7 @@ def export_data_to_csv(table_name, csv_file_path):
             cursor.close()
             conn.close()
             logger.info("Successfully exported data from '%s' to CSV.", table_name)
-            return True
+            return True, exact_row_count
     except Error as e:
         if e.errno == 2002 and config.DB_HOST.lower() == 'localhost':
             logger.warning("Socket connection failed during CSV export. Falling back to TCP/IP via 127.0.0.1 for '%s'", table_name)
@@ -278,7 +287,7 @@ def export_data_to_csv(table_name, csv_file_path):
             return export_data_to_csv(table_name, csv_file_path)
             
         logger.error("Error exporting to CSV for table '%s': %s", table_name, e)
-    return False
+    return False, 0
 
 def create_destination_db():
     logger.info("Connecting to destination server %s...", config.DEST_DB_HOST)
@@ -320,7 +329,7 @@ def load_sql_schema(filepath):
         command.extend([f"-h{config.DEST_DB_HOST}"])
     
     command.extend([
-        "--connect_timeout=10", "--max_allowed_packet=1G",
+        "--connect-timeout=10", "--max-allowed-packet=1G",
         f"-u{config.DEST_DB_USER}", f"--password={config.DEST_DB_PASSWORD}", config.DEST_DB_DATABASE
     ])
 
@@ -440,7 +449,7 @@ def _execute_fallback_insert(target_table_name, headers, rows):
         logger.error("Fallback failed to load CSV chunk for '%s': %s", target_table_name, e)
     return False
 
-def load_csv_to_dest(target_table_name, csv_file_path, state):
+def load_csv_to_dest(target_table_name, csv_file_path, state, total_rows=None):
     """Uses LOAD DATA LOCAL INFILE to bulk load the CSV data into the destination table in chunks."""
     logger.info("Loading CSV into destination table '%s' in chunks...", target_table_name)
     
@@ -448,11 +457,15 @@ def load_csv_to_dest(target_table_name, csv_file_path, state):
     state.setdefault("chunk_progress", {})
     last_chunk_loaded = state["chunk_progress"].get(target_table_name, -1)
     
-    try:
-        with open(csv_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            total_rows = max(0, sum(1 for _ in f) - 1)
-    except:
-        total_rows = 0
+    if total_rows is None:
+        try:
+            logger.info("Counting total rows in CSV for '%s' to initialize progress bar...", target_table_name)
+            with open(csv_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                total_rows = max(0, sum(1 for _ in f) - 1)
+            logger.info("Counted %s rows in CSV for '%s'.", total_rows, target_table_name)
+        except Exception as e:
+            logger.error("Failed to count rows for '%s': %s", target_table_name, e)
+            total_rows = 0
 
     t_start = time.time()
     temp_csv = f"{csv_file_path}.chunk.tmp"
@@ -568,8 +581,11 @@ def run_migration(tables, state, suffix):
                 )
                 if conn.is_connected():
                     cursor = conn.cursor()
-                    cursor.execute(f"SELECT COUNT(*) FROM `{table_name}`")
-                    count = int(cursor.fetchone()[0])
+                    cursor.execute(f"ANALYZE TABLE `{table_name}`")
+                    cursor.fetchall() # clear results of analyze table
+                    cursor.execute(f"SELECT TABLE_ROWS FROM information_schema.tables WHERE table_schema = '{config.DEST_DB_DATABASE}' AND table_name = '{table_name}'")
+                    row = cursor.fetchone()
+                    count = int(row[0]) if row and row[0] is not None else 0
                     cursor.close()
                     conn.close()
                     return count
@@ -590,6 +606,8 @@ def run_migration(tables, state, suffix):
         is_resuming = chunk_progress > -1
         remarks = "Success"
         
+        extracted_row_count = state.get("csv_row_counts", {}).get(table)
+        
         if is_resuming:
             logger.info("Resuming table '%s' from chunk %s...", table, chunk_progress + 1)
             use_existing = False
@@ -597,9 +615,19 @@ def run_migration(tables, state, suffix):
                 logger.info("Using existing CSV file for resuming '%s'.", table)
                 use_existing = True
             
-            if use_existing or export_data_to_csv(table, csv_file):
+            export_success = False
+            if use_existing:
+                export_success = True
+            else:
+                export_success, exact_count = export_data_to_csv(table, csv_file)
+                if export_success:
+                    extracted_row_count = exact_count
+                    state.setdefault("csv_row_counts", {})[table] = exact_count
+                    save_state(state)
+            
+            if export_success:
                 # Skip schema drop/create, go straight to appending CSV data
-                if load_csv_to_dest(target_table_name, csv_file, state):
+                if load_csv_to_dest(target_table_name, csv_file, state, extracted_row_count):
                     elapsed = format_time(time.time() - t_start)
                     logger.info("Total migration for table '%s' completed in %s.", table, elapsed)
                     successful_migrations += 1
@@ -630,11 +658,21 @@ def run_migration(tables, state, suffix):
                         else:
                             logger.info("User chose to re-extract CSV for '%s'.", table)
                         
-                    if use_existing or export_data_to_csv(table, csv_file):
+                    export_success = False
+                    if use_existing:
+                        export_success = True
+                    else:
+                        export_success, exact_count = export_data_to_csv(table, csv_file)
+                        if export_success:
+                            extracted_row_count = exact_count
+                            state.setdefault("csv_row_counts", {})[table] = exact_count
+                            save_state(state)
+                        
+                    if export_success:
                         # 4. Load Schema to destination DB
                         if load_sql_schema(processed_schema):
                             # 5. Load CSV to destination DB
-                            if load_csv_to_dest(target_table_name, csv_file, state):
+                            if load_csv_to_dest(target_table_name, csv_file, state, extracted_row_count):
                                 elapsed = format_time(time.time() - t_start)
                                 logger.info("Total migration for table '%s' completed in %s.", table, elapsed)
                                 successful_migrations += 1

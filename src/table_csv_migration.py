@@ -35,6 +35,29 @@ def format_time(seconds):
         return f"{seconds / 60:.2f} minutes"
     return f"{seconds:.2f} seconds"
 
+def get_db_connection(host, user, password, database=None, charset=None):
+    """Helper to create a MySQL connection, automatically finding the socket file on Linux if localhost."""
+    kwargs = {
+        'host': host,
+        'user': user,
+        'password': password,
+        'connect_timeout': 10
+    }
+    if database:
+        kwargs['database'] = database
+    if charset:
+        kwargs['charset'] = charset
+        
+    if host.lower() == 'localhost' and os.name != 'nt':
+        common_sockets = ['/var/run/mysqld/mysqld.sock', '/var/lib/mysql/mysql.sock', '/tmp/mysql.sock']
+        for sock in common_sockets:
+            if os.path.exists(sock):
+                kwargs['unix_socket'] = sock
+                logger.debug("Using Unix socket: %s", sock)
+                break
+                
+    return mysql.connector.connect(**kwargs)
+
 def load_state():
     if os.path.exists(state_file):
         try:
@@ -55,12 +78,11 @@ def get_lib_tables(pattern=None, from_list=None):
     logger.info("Connecting to MySQL Server %s...", config.DB_HOST)
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            conn = mysql.connector.connect(
+            conn = get_db_connection(
                 host=config.DB_HOST,
                 database=config.DB_DATABASE,
                 user=config.DB_USER,
-                password=config.DB_PASSWORD,
-                connect_timeout=10
+                password=config.DB_PASSWORD
             )
             if conn.is_connected():
                 logger.info("Successfully connected to database '%s'.", config.DB_DATABASE)
@@ -217,13 +239,12 @@ def export_data_to_csv(table_name, csv_file_path):
        Uses Primary Key chunking (pagination) to prevent memory spikes on large tables."""
     logger.info("Exporting data from '%s' to CSV...", table_name)
     try:
-        conn = mysql.connector.connect(
+        conn = get_db_connection(
             host=config.DB_HOST,
             user=config.DB_USER,
             password=config.DB_PASSWORD,
             database=config.DB_DATABASE,
-            charset='utf8mb4',
-            connect_timeout=10
+            charset='utf8mb4'
         )
         if conn.is_connected():
             cursor = conn.cursor()
@@ -293,11 +314,10 @@ def create_destination_db():
     logger.info("Connecting to destination server %s...", config.DEST_DB_HOST)
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            conn = mysql.connector.connect(
+            conn = get_db_connection(
                 host=config.DEST_DB_HOST,
                 user=config.DEST_DB_USER,
-                password=config.DEST_DB_PASSWORD,
-                connect_timeout=10
+                password=config.DEST_DB_PASSWORD
             )
             if conn.is_connected():
                 cursor = conn.cursor()
@@ -411,13 +431,12 @@ def _execute_load_data_infile(target_table_name, csv_file_path):
 
 def _execute_fallback_insert(target_table_name, headers, rows):
     try:
-        conn = mysql.connector.connect(
+        conn = get_db_connection(
             host=config.DEST_DB_HOST,
             user=config.DEST_DB_USER,
             password=config.DEST_DB_PASSWORD,
             database=config.DEST_DB_DATABASE,
-            charset='utf8mb4',
-            connect_timeout=10
+            charset='utf8mb4'
         )
         if conn.is_connected():
             cursor = conn.cursor()
@@ -733,11 +752,10 @@ def run_migration(tables, state, suffix):
 def choose_database():
     print(f"\nConnecting to Server {config.DB_HOST} to fetch databases...")
     try:
-        conn = mysql.connector.connect(
+        conn = get_db_connection(
             host=config.DB_HOST,
             user=config.DB_USER,
-            password=config.DB_PASSWORD,
-            connect_timeout=10
+            password=config.DB_PASSWORD
         )
         if conn.is_connected():
             cursor = conn.cursor()
@@ -775,11 +793,10 @@ def choose_database():
 def choose_destination_database():
     print(f"\nConnecting to Destination Server {config.DEST_DB_HOST} to fetch databases...")
     try:
-        conn = mysql.connector.connect(
+        conn = get_db_connection(
             host=config.DEST_DB_HOST,
             user=config.DEST_DB_USER,
-            password=config.DEST_DB_PASSWORD,
-            connect_timeout=10
+            password=config.DEST_DB_PASSWORD
         )
         if conn.is_connected():
             cursor = conn.cursor()

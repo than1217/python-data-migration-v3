@@ -69,7 +69,7 @@ def load_state():
                 return json.load(f)
         except Exception as e:
             logger.error("Error loading state file: %s", e)
-    return {"processed_tables": [], "migrated_tables": [], "pattern": None, "from_list": None}
+    return {"processed_tables": [], "migrated_tables": [], "pattern": None, "from_list": None, "csv_load_progress": {}, "final_row_counts": {}}
 
 def save_state(state):
     try:
@@ -472,73 +472,76 @@ def _execute_fallback_insert(target_table_name, headers, rows):
         logger.error("Fallback failed to load CSV chunk for '%s': %s", target_table_name, e)
     return False
 
-def load_csv_to_dest(target_table_name, csv_file_path, state, total_rows=None):
-    """Uses LOAD DATA LOCAL INFILE to bulk load the CSV data into the destination table in chunks."""
+def load_csv_to_dest(target_table_name, csv_file_path, state):
+    """Uses LOAD DATA LOCAL INFILE to bulk load the CSV data into the destination table in chunks using file size for progress."""
     logger.info("Loading CSV into destination table '%s' in chunks...", target_table_name)
     
     chunk_size = 250000
-    state.setdefault("chunk_progress", {})
-    last_chunk_loaded = state["chunk_progress"].get(target_table_name, -1)
+    file_size = os.path.getsize(csv_file_path)
+    state.setdefault("csv_load_progress", {})
     
-    if total_rows is None:
-        try:
-            logger.info("Counting total rows in CSV for '%s' to initialize progress bar...", target_table_name)
-            with open(csv_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                total_rows = max(0, sum(1 for _ in f) - 1)
-            logger.info("Counted %s rows in CSV for '%s'.", total_rows, target_table_name)
-        except Exception as e:
-            logger.error("Failed to count rows for '%s': %s", target_table_name, e)
-            total_rows = 0
+    progress = state["csv_load_progress"].get(target_table_name, {})
+    last_byte_pos = progress.get("last_byte_pos", 0)
+    rows_loaded = progress.get("rows_loaded", 0)
 
     t_start = time.time()
     temp_csv = f"{csv_file_path}.chunk.tmp"
     
     with open(csv_file_path, 'r', encoding='utf-8', newline='') as f:
-        reader = csv.reader(f)
-        headers = next(reader, None)
-        if not headers:
+        header_line = f.readline()
+        if not header_line:
             logger.warning("CSV is empty for table '%s'.", target_table_name)
+            state["csv_load_progress"][target_table_name] = {"last_byte_pos": 0, "rows_loaded": 0}
             return True
             
-        chunk_idx = 0
-        with tqdm(total=total_rows, desc=f"Loading CSV {target_table_name}", unit="row", leave=False) as pbar:
+        headers = next(csv.reader([header_line]))
+        
+        if last_byte_pos == 0:
+            last_byte_pos = f.tell()
+        else:
+            f.seek(last_byte_pos)
+            
+        with tqdm(total=file_size, initial=last_byte_pos, desc=f"Loading CSV {target_table_name}", unit="B", unit_scale=True, leave=False) as pbar:
             while True:
                 chunk_rows = []
                 for _ in range(chunk_size):
-                    try:
-                        chunk_rows.append(next(reader))
-                    except StopIteration:
+                    line = f.readline()
+                    if not line:
                         break
-                        
+                    chunk_rows.append(line)
+                    
                 if not chunk_rows:
                     break
                     
-                if chunk_idx <= last_chunk_loaded:
-                    pbar.update(len(chunk_rows))
-                    chunk_idx += 1
-                    continue
-                    
                 with open(temp_csv, 'w', encoding='utf-8', newline='') as tf:
-                    writer = csv.writer(tf, quoting=csv.QUOTE_MINIMAL)
-                    writer.writerow(headers)
-                    writer.writerows(chunk_rows)
+                    tf.write(header_line)
+                    tf.writelines(chunk_rows)
                     
+                current_byte_pos = f.tell()
+                bytes_processed = current_byte_pos - last_byte_pos
+                
                 success = _execute_load_data_infile(target_table_name, temp_csv)
                 if not success:
-                    logger.info("Falling back to Python mysql.connector for chunk %s of '%s'...", chunk_idx, target_table_name)
-                    success = _execute_fallback_insert(target_table_name, headers, chunk_rows)
+                    logger.info("Falling back to Python mysql.connector for chunk of '%s'...", target_table_name)
+                    parsed_rows = list(csv.reader(chunk_rows))
+                    success = _execute_fallback_insert(target_table_name, headers, parsed_rows)
                     
                 if not success:
-                    logger.error("Failed to load chunk %s for table '%s'.", chunk_idx, target_table_name)
+                    logger.error("Failed to load chunk for table '%s'.", target_table_name)
                     if os.path.exists(temp_csv):
                         os.remove(temp_csv)
                     return False
                     
-                state["chunk_progress"][target_table_name] = chunk_idx
+                rows_loaded += len(chunk_rows)
+                last_byte_pos = current_byte_pos
+                
+                state["csv_load_progress"][target_table_name] = {
+                    "last_byte_pos": last_byte_pos,
+                    "rows_loaded": rows_loaded
+                }
                 save_state(state)
                 
-                pbar.update(len(chunk_rows))
-                chunk_idx += 1
+                pbar.update(bytes_processed)
 
     if os.path.exists(temp_csv):
         os.remove(temp_csv)
@@ -595,7 +598,7 @@ def run_migration(tables, state, suffix):
         csv_file = os.path.join(csv_dir, f"{target_table_name}.csv")
         
         # Retrieve row counts from state if available
-        total_rows_migrated = state.get("csv_row_counts", {}).get(table, 0)
+        total_rows_migrated = state.get("final_row_counts", {}).get(target_table_name, 0)
 
         if table in state.get("migrated_tables", []):
             logger.info("Skipping '%s', already migrated in previous session.", table)
@@ -605,14 +608,12 @@ def run_migration(tables, state, suffix):
             
         t_start = time.time()
         
-        chunk_progress = state.get("chunk_progress", {}).get(target_table_name, -1)
-        is_resuming = chunk_progress > -1
+        csv_load_progress = state.get("csv_load_progress", {}).get(target_table_name, {})
+        is_resuming = "last_byte_pos" in csv_load_progress
         remarks = "Success"
         
-        extracted_row_count = state.get("csv_row_counts", {}).get(table)
-        
         if is_resuming:
-            logger.info("Resuming table '%s' from chunk %s...", table, chunk_progress + 1)
+            logger.info("Resuming table '%s'...", table)
             use_existing = False
             if os.path.exists(csv_file):
                 logger.info("Using existing CSV file for resuming '%s'.", table)
@@ -621,33 +622,24 @@ def run_migration(tables, state, suffix):
             export_success = False
             if use_existing:
                 export_success = True
-                if extracted_row_count is None:
-                    try:
-                        with open(csv_file, 'r', encoding='utf-8', errors='ignore') as f:
-                            extracted_row_count = max(0, sum(1 for _ in f) - 1)
-                        state.setdefault("csv_row_counts", {})[table] = extracted_row_count
-                        save_state(state)
-                    except Exception as e:
-                        logger.error("Failed to count rows for '%s': %s", table, e)
-                        extracted_row_count = 0
             else:
                 export_success, exact_count = export_data_to_csv(table, csv_file)
-                if export_success:
-                    extracted_row_count = exact_count
-                    state.setdefault("csv_row_counts", {})[table] = exact_count
-                    save_state(state)
             
             if export_success:
                 # Skip schema drop/create, go straight to appending CSV data
-                if load_csv_to_dest(target_table_name, csv_file, state, extracted_row_count):
+                if load_csv_to_dest(target_table_name, csv_file, state):
                     elapsed = format_time(time.time() - t_start)
                     logger.info("Total migration for table '%s' completed in %s.", table, elapsed)
                     successful_migrations += 1
                     if "migrated_tables" not in state:
                         state["migrated_tables"] = []
                     state["migrated_tables"].append(table)
-                    if target_table_name in state.get("chunk_progress", {}):
-                        del state["chunk_progress"][target_table_name]
+                    
+                    final_row_count = state.get("csv_load_progress", {}).get(target_table_name, {}).get("rows_loaded", 0)
+                    state.setdefault("final_row_counts", {})[target_table_name] = final_row_count
+                    
+                    if target_table_name in state.get("csv_load_progress", {}):
+                        del state["csv_load_progress"][target_table_name]
                     save_state(state)
                 else:
                     remarks = "Failed: Load CSV to destination (Resume)"
@@ -673,35 +665,26 @@ def run_migration(tables, state, suffix):
                     export_success = False
                     if use_existing:
                         export_success = True
-                        if extracted_row_count is None:
-                            try:
-                                with open(csv_file, 'r', encoding='utf-8', errors='ignore') as f:
-                                    extracted_row_count = max(0, sum(1 for _ in f) - 1)
-                                state.setdefault("csv_row_counts", {})[table] = extracted_row_count
-                                save_state(state)
-                            except Exception as e:
-                                logger.error("Failed to count rows for '%s': %s", table, e)
-                                extracted_row_count = 0
                     else:
                         export_success, exact_count = export_data_to_csv(table, csv_file)
-                        if export_success:
-                            extracted_row_count = exact_count
-                            state.setdefault("csv_row_counts", {})[table] = exact_count
-                            save_state(state)
                         
                     if export_success:
                         # 4. Load Schema to destination DB
                         if load_sql_schema(processed_schema):
                             # 5. Load CSV to destination DB
-                            if load_csv_to_dest(target_table_name, csv_file, state, extracted_row_count):
+                            if load_csv_to_dest(target_table_name, csv_file, state):
                                 elapsed = format_time(time.time() - t_start)
                                 logger.info("Total migration for table '%s' completed in %s.", table, elapsed)
                                 successful_migrations += 1
                                 if "migrated_tables" not in state:
                                     state["migrated_tables"] = []
                                 state["migrated_tables"].append(table)
-                                if target_table_name in state.get("chunk_progress", {}):
-                                    del state["chunk_progress"][target_table_name]
+                                
+                                final_row_count = state.get("csv_load_progress", {}).get(target_table_name, {}).get("rows_loaded", 0)
+                                state.setdefault("final_row_counts", {})[target_table_name] = final_row_count
+                                
+                                if target_table_name in state.get("csv_load_progress", {}):
+                                    del state["csv_load_progress"][target_table_name]
                                 save_state(state)
                             else:
                                 remarks = "Failed: Load CSV to destination"
@@ -724,7 +707,7 @@ def run_migration(tables, state, suffix):
         
         # Use recorded row count instead of querying information schema
         if "Success" in remarks:
-            total_rows_migrated = state.get("csv_row_counts", {}).get(table, 0)
+            total_rows_migrated = state.get("final_row_counts", {}).get(target_table_name, 0)
             
         summary_data.append([target_table_name, elapsed, ddl_content, total_rows_migrated, remarks])
             
@@ -862,10 +845,10 @@ def migration_menu(suffix):
             pattern = input("Enter regular expression pattern (e.g., '^lib_.*'): ").strip()
             if not pattern: continue
             state = load_state()
-            if state.get("migrated_tables") or state.get("chunk_progress"):
+            if state.get("migrated_tables") or state.get("csv_load_progress"):
                 resume = input("\nExisting migration progress found. Resume? (y/n): ").strip().lower()
                 if resume != 'y':
-                    state = {"migrated_tables": [], "chunk_progress": {}, "csv_row_counts": {}}
+                    state = {"migrated_tables": [], "csv_load_progress": {}, "final_row_counts": {}}
                     save_state(state)
             tables = get_lib_tables(pattern=pattern)
             run_migration(tables, state, suffix)
@@ -875,10 +858,10 @@ def migration_menu(suffix):
             if not tables_input: continue
             table_list = [t.strip() for t in tables_input.split(',')]
             state = load_state()
-            if state.get("migrated_tables") or state.get("chunk_progress"):
+            if state.get("migrated_tables") or state.get("csv_load_progress"):
                 resume = input("\nExisting migration progress found. Resume? (y/n): ").strip().lower()
                 if resume != 'y':
-                    state = {"migrated_tables": [], "chunk_progress": {}, "csv_row_counts": {}}
+                    state = {"migrated_tables": [], "csv_load_progress": {}, "final_row_counts": {}}
                     save_state(state)
             tables = get_lib_tables(from_list=table_list)
             run_migration(tables, state, suffix)
@@ -927,7 +910,7 @@ def main():
         
         state = load_state()
         if headless_config.get('force_restart', False):
-            state = {"migrated_tables": [], "chunk_progress": {}, "csv_row_counts": {}}
+            state = {"migrated_tables": [], "csv_load_progress": {}, "final_row_counts": {}}
             save_state(state)
         
         if pattern:

@@ -53,10 +53,14 @@ def get_db_connection(host, user, password, database=None, charset=None):
         for sock in common_sockets:
             if os.path.exists(sock):
                 kwargs['unix_socket'] = sock
-                logger.debug("Using Unix socket: %s", sock)
                 break
                 
-    return mysql.connector.connect(**kwargs)
+    conn = mysql.connector.connect(**kwargs)
+    if 'unix_socket' in kwargs:
+        logger.info("Database connection established using Unix Socket: %s", kwargs['unix_socket'])
+    else:
+        logger.info("Database connection established using TCP/IP (Host: %s)", host)
+    return conn
 
 def load_state():
     if os.path.exists(state_file):

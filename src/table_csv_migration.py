@@ -571,32 +571,12 @@ def run_migration(tables, state, suffix):
         processed_schema = os.path.join(processed_dir, f"{target_table_name}_schema.sql")
         csv_file = os.path.join(csv_dir, f"{target_table_name}.csv")
         
-        # Determine total rows for summary (requires DB connection or counting CSV)
-        total_rows_migrated = 0
-        def get_total_rows(table_name):
-            try:
-                conn = mysql.connector.connect(
-                    host=config.DEST_DB_HOST, user=config.DEST_DB_USER,
-                    password=config.DEST_DB_PASSWORD, database=config.DEST_DB_DATABASE, connect_timeout=5
-                )
-                if conn.is_connected():
-                    cursor = conn.cursor()
-                    cursor.execute(f"ANALYZE TABLE `{table_name}`")
-                    cursor.fetchall() # clear results of analyze table
-                    cursor.execute(f"SELECT TABLE_ROWS FROM information_schema.tables WHERE table_schema = '{config.DEST_DB_DATABASE}' AND table_name = '{table_name}'")
-                    row = cursor.fetchone()
-                    count = int(row[0]) if row and row[0] is not None else 0
-                    cursor.close()
-                    conn.close()
-                    return count
-            except:
-                pass
-            return 0
+        # Retrieve row counts from state if available
+        total_rows_migrated = state.get("csv_row_counts", {}).get(table, 0)
 
         if table in state.get("migrated_tables", []):
             logger.info("Skipping '%s', already migrated in previous session.", table)
             ddl_content = get_ddl_content(processed_schema)
-            total_rows_migrated = get_total_rows(target_table_name)
             summary_data.append([target_table_name, "Skipped", ddl_content, total_rows_migrated, "Success (Already migrated)"])
             continue
             
@@ -618,6 +598,15 @@ def run_migration(tables, state, suffix):
             export_success = False
             if use_existing:
                 export_success = True
+                if extracted_row_count is None:
+                    try:
+                        with open(csv_file, 'r', encoding='utf-8', errors='ignore') as f:
+                            extracted_row_count = max(0, sum(1 for _ in f) - 1)
+                        state.setdefault("csv_row_counts", {})[table] = extracted_row_count
+                        save_state(state)
+                    except Exception as e:
+                        logger.error("Failed to count rows for '%s': %s", table, e)
+                        extracted_row_count = 0
             else:
                 export_success, exact_count = export_data_to_csv(table, csv_file)
                 if export_success:
@@ -661,6 +650,15 @@ def run_migration(tables, state, suffix):
                     export_success = False
                     if use_existing:
                         export_success = True
+                        if extracted_row_count is None:
+                            try:
+                                with open(csv_file, 'r', encoding='utf-8', errors='ignore') as f:
+                                    extracted_row_count = max(0, sum(1 for _ in f) - 1)
+                                state.setdefault("csv_row_counts", {})[table] = extracted_row_count
+                                save_state(state)
+                            except Exception as e:
+                                logger.error("Failed to count rows for '%s': %s", table, e)
+                                extracted_row_count = 0
                     else:
                         export_success, exact_count = export_data_to_csv(table, csv_file)
                         if export_success:
@@ -701,9 +699,9 @@ def run_migration(tables, state, suffix):
         elapsed = format_time(time.time() - t_start)
         ddl_content = get_ddl_content(processed_schema)
         
-        # If successfully loaded or already partially loaded, count rows in destination
+        # Use recorded row count instead of querying information schema
         if "Success" in remarks:
-            total_rows_migrated = get_total_rows(target_table_name)
+            total_rows_migrated = state.get("csv_row_counts", {}).get(table, 0)
             
         summary_data.append([target_table_name, elapsed, ddl_content, total_rows_migrated, remarks])
             
@@ -842,8 +840,12 @@ def migration_menu(suffix):
         if choice == '1':
             pattern = input("Enter regular expression pattern (e.g., '^lib_.*'): ").strip()
             if not pattern: continue
-            state = {"migrated_tables": []}
-            save_state(state)
+            state = load_state()
+            if state.get("migrated_tables") or state.get("chunk_progress"):
+                resume = input("\nExisting migration progress found. Resume? (y/n): ").strip().lower()
+                if resume != 'y':
+                    state = {"migrated_tables": [], "chunk_progress": {}, "csv_row_counts": {}}
+                    save_state(state)
             tables = get_lib_tables(pattern=pattern)
             run_migration(tables, state, suffix)
             
@@ -851,8 +853,12 @@ def migration_menu(suffix):
             tables_input = input("Enter table names separated by commas: ").strip()
             if not tables_input: continue
             table_list = [t.strip() for t in tables_input.split(',')]
-            state = {"migrated_tables": []}
-            save_state(state)
+            state = load_state()
+            if state.get("migrated_tables") or state.get("chunk_progress"):
+                resume = input("\nExisting migration progress found. Resume? (y/n): ").strip().lower()
+                if resume != 'y':
+                    state = {"migrated_tables": [], "chunk_progress": {}, "csv_row_counts": {}}
+                    save_state(state)
             tables = get_lib_tables(from_list=table_list)
             run_migration(tables, state, suffix)
             
@@ -898,8 +904,10 @@ def main():
         print(f"Target: {config.DEST_DB_HOST} -> {config.DEST_DB_DATABASE}")
         print(f"Suffix: {suffix}")
         
-        state = {"migrated_tables": []}
-        save_state(state)
+        state = load_state()
+        if headless_config.get('force_restart', False):
+            state = {"migrated_tables": [], "chunk_progress": {}, "csv_row_counts": {}}
+            save_state(state)
         
         if pattern:
             tables = get_lib_tables(pattern=pattern)

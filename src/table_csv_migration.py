@@ -431,11 +431,11 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
                 else:
                     err_file.seek(0)
                     error_msg = err_file.read()
-                    logger.error("Attempt %s/%s failed to load chunk CSV for '%s' (local=%s): %s", attempt, retries, target_table_name, use_local, error_msg)
+                    logger.error("Attempt %s/%s failed to load CSV for '%s' (local=%s): %s", attempt, retries, target_table_name, use_local, error_msg)
                     if attempt < retries:
                         time.sleep(RETRY_DELAY)
             except Exception as e:
-                logger.error("Attempt %s/%s unexpected error loading chunk CSV for '%s' (local=%s): %s", attempt, retries, target_table_name, use_local, e)
+                logger.error("Attempt %s/%s unexpected error loading CSV for '%s' (local=%s): %s", attempt, retries, target_table_name, use_local, e)
                 if attempt < retries:
                     time.sleep(RETRY_DELAY)
     return False
@@ -480,10 +480,7 @@ def _execute_fallback_insert(target_table_name, headers, rows):
     return False
 
 def load_csv_to_dest(target_table_name, csv_file_path, state):
-    """Uses LOAD DATA LOCAL INFILE to bulk load the CSV data into the destination table in chunks using file size for progress."""
-    logger.info("Loading CSV into destination table '%s' in chunks...", target_table_name)
-    
-    chunk_size = 250000
+    """Uses LOAD DATA INFILE for the entire CSV, falling back to LOAD DATA LOCAL INFILE in chunks."""
     file_size = os.path.getsize(csv_file_path)
     state.setdefault("csv_load_progress", {})
     
@@ -492,6 +489,39 @@ def load_csv_to_dest(target_table_name, csv_file_path, state):
     rows_loaded = progress.get("rows_loaded", 0)
 
     t_start = time.time()
+
+    if last_byte_pos == 0:
+        logger.info("Attempting full LOAD DATA INFILE for '%s'...", target_table_name)
+        success = _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
+        if success:
+            try:
+                conn = get_db_connection(
+                    host=config.DEST_DB_HOST,
+                    user=config.DEST_DB_USER,
+                    password=config.DEST_DB_PASSWORD,
+                    database=config.DEST_DB_DATABASE
+                )
+                if conn.is_connected():
+                    cursor = conn.cursor()
+                    cursor.execute(f"SELECT COUNT(*) FROM `{target_table_name}`")
+                    rows_loaded = cursor.fetchone()[0]
+                    cursor.close()
+                    conn.close()
+            except Exception as e:
+                logger.warning("Could not fetch loaded row count for '%s': %s", target_table_name, e)
+                
+            state["csv_load_progress"][target_table_name] = {
+                "last_byte_pos": file_size,
+                "rows_loaded": rows_loaded
+            }
+            save_state(state)
+            logger.info("Successfully loaded full CSV into '%s' in %s.", target_table_name, format_time(time.time() - t_start))
+            return True
+            
+        logger.info("Full LOAD DATA INFILE failed. Falling back to chunked LOAD DATA LOCAL INFILE...")
+
+    logger.info("Loading CSV into destination table '%s' in chunks...", target_table_name)
+    chunk_size = 250000
     temp_csv = f"{csv_file_path}.chunk.tmp"
     
     with open(csv_file_path, 'r', encoding='utf-8', newline='') as f:
@@ -527,12 +557,8 @@ def load_csv_to_dest(target_table_name, csv_file_path, state):
                 current_byte_pos = f.tell()
                 bytes_processed = current_byte_pos - last_byte_pos
                 
-                # Try server-side LOAD DATA INFILE first for max speed
-                success = _execute_load_data_infile(target_table_name, temp_csv, use_local=False)
-                
-                if not success:
-                    logger.info("Falling back to LOAD DATA LOCAL INFILE for chunk of '%s'...", target_table_name)
-                    success = _execute_load_data_infile(target_table_name, temp_csv, use_local=True)
+                # Use LOAD DATA LOCAL INFILE for chunk since full LOAD DATA INFILE failed
+                success = _execute_load_data_infile(target_table_name, temp_csv, use_local=True)
                 
                 if not success:
                     logger.info("Falling back to Python mysql.connector for chunk of '%s'...", target_table_name)

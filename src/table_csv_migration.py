@@ -382,13 +382,15 @@ def load_sql_schema(filepath):
                     time.sleep(RETRY_DELAY)
     return False
 
-def _execute_load_data_infile(target_table_name, csv_file_path):
+def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False):
     command = [
         config.MYSQL_PATH,
-        "--local-infile=1",
         "--connect_timeout=10",
         "--max_allowed_packet=1G",
     ]
+    
+    if use_local:
+        command.insert(1, "--local-infile=1")
 
     if config.DEST_DB_HOST.lower() not in ['localhost', '127.0.0.1']:
         command.extend([f"-h{config.DEST_DB_HOST}"])
@@ -398,12 +400,15 @@ def _execute_load_data_infile(target_table_name, csv_file_path):
     ])
 
     mysql_csv_path = csv_file_path.replace('\\', '/')
+    local_str = "LOCAL " if use_local else ""
+    
+    logger.info("Executing LOAD DATA %sINFILE for '%s'", local_str, target_table_name)
     
     sql_command = f"""
     SET SESSION sql_mode='';
     SET SESSION FOREIGN_KEY_CHECKS=0;
     SET SESSION UNIQUE_CHECKS=0;
-    LOAD DATA LOCAL INFILE '{mysql_csv_path}'
+    LOAD DATA {local_str}INFILE '{mysql_csv_path}'
     INTO TABLE `{target_table_name}`
     CHARACTER SET utf8mb4
     FIELDS TERMINATED BY ','
@@ -414,7 +419,8 @@ def _execute_load_data_infile(target_table_name, csv_file_path):
     """
     
     import tempfile
-    for attempt in range(1, MAX_RETRIES + 1):
+    retries = MAX_RETRIES if use_local else 1
+    for attempt in range(1, retries + 1):
         with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as err_file:
             try:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err_file, text=True)
@@ -424,12 +430,13 @@ def _execute_load_data_infile(target_table_name, csv_file_path):
                     return True
                 else:
                     err_file.seek(0)
-                    logger.error("Attempt %s/%s failed to load chunk CSV for '%s': %s", attempt, MAX_RETRIES, target_table_name, err_file.read())
-                    if attempt < MAX_RETRIES:
+                    error_msg = err_file.read()
+                    logger.error("Attempt %s/%s failed to load chunk CSV for '%s' (local=%s): %s", attempt, retries, target_table_name, use_local, error_msg)
+                    if attempt < retries:
                         time.sleep(RETRY_DELAY)
             except Exception as e:
-                logger.error("Attempt %s/%s unexpected error loading chunk CSV for '%s': %s", attempt, MAX_RETRIES, target_table_name, e)
-                if attempt < MAX_RETRIES:
+                logger.error("Attempt %s/%s unexpected error loading chunk CSV for '%s' (local=%s): %s", attempt, retries, target_table_name, use_local, e)
+                if attempt < retries:
                     time.sleep(RETRY_DELAY)
     return False
 
@@ -520,7 +527,13 @@ def load_csv_to_dest(target_table_name, csv_file_path, state):
                 current_byte_pos = f.tell()
                 bytes_processed = current_byte_pos - last_byte_pos
                 
-                success = _execute_load_data_infile(target_table_name, temp_csv)
+                # Try server-side LOAD DATA INFILE first for max speed
+                success = _execute_load_data_infile(target_table_name, temp_csv, use_local=False)
+                
+                if not success:
+                    logger.info("Falling back to LOAD DATA LOCAL INFILE for chunk of '%s'...", target_table_name)
+                    success = _execute_load_data_infile(target_table_name, temp_csv, use_local=True)
+                
                 if not success:
                     logger.info("Falling back to Python mysql.connector for chunk of '%s'...", target_table_name)
                     parsed_rows = list(csv.reader(chunk_rows))

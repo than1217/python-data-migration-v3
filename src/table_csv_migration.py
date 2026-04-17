@@ -484,6 +484,8 @@ def load_csv_to_dest(target_table_name, csv_file_path, state):
     file_size = os.path.getsize(csv_file_path)
     state.setdefault("csv_load_progress", {})
     
+    import tempfile
+    
     progress = state["csv_load_progress"].get(target_table_name, {})
     last_byte_pos = progress.get("last_byte_pos", 0)
     rows_loaded = progress.get("rows_loaded", 0)
@@ -522,7 +524,8 @@ def load_csv_to_dest(target_table_name, csv_file_path, state):
 
     logger.info("Loading CSV into destination table '%s' in chunks...", target_table_name)
     chunk_size = 250000
-    temp_csv = f"{csv_file_path}.chunk.tmp"
+    temp_dir = tempfile.gettempdir()
+    temp_csv = os.path.join(temp_dir, f"{target_table_name}_chunk.tmp")
     
     with open(csv_file_path, 'r', encoding='utf-8', newline='') as f:
         header_line = f.readline()

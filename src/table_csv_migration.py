@@ -518,7 +518,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state):
             logger.info("Successfully loaded full CSV into '%s' in %s.", target_table_name, format_time(time.time() - t_start))
             return True
             
-        logger.info("Full LOAD DATA INFILE failed. Falling back to chunked LOAD DATA LOCAL INFILE...")
+        logger.info("Full LOAD DATA INFILE failed. Falling back to chunked loading...")
 
     logger.info("Loading CSV into destination table '%s' in chunks...", target_table_name)
     chunk_size = 250000
@@ -557,8 +557,12 @@ def load_csv_to_dest(target_table_name, csv_file_path, state):
                 current_byte_pos = f.tell()
                 bytes_processed = current_byte_pos - last_byte_pos
                 
-                # Use LOAD DATA LOCAL INFILE for chunk since full LOAD DATA INFILE failed
-                success = _execute_load_data_infile(target_table_name, temp_csv, use_local=True)
+                # Try standard LOAD DATA INFILE for the chunk first
+                success = _execute_load_data_infile(target_table_name, temp_csv, use_local=False)
+                
+                if not success:
+                    logger.info("Chunk LOAD DATA INFILE failed for '%s'. Falling back to LOAD DATA LOCAL INFILE...", target_table_name)
+                    success = _execute_load_data_infile(target_table_name, temp_csv, use_local=True)
                 
                 if not success:
                     logger.info("Falling back to Python mysql.connector for chunk of '%s'...", target_table_name)

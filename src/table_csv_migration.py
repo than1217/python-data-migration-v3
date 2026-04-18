@@ -958,6 +958,9 @@ def main():
         if headless_config.get('force_restart', False):
             state = {"migrated_tables": [], "csv_load_progress": {}, "final_row_counts": {}}
             save_state(state)
+        elif state.get("migrated_tables") or state.get("csv_load_progress"):
+            logger.info("Existing migration state found. Resuming headless migration.")
+            print("Existing migration progress found. Resuming automatically...")
         
         if pattern:
             tables = get_lib_tables(pattern=pattern)

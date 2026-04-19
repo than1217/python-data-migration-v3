@@ -58,9 +58,12 @@ python src/table_csv_migration.py --headless config.json
   "suffix": "_v3",
   "db_host": "10.10.10.96",
   "db_database": "source_db_name",
+  "db_user": "source_user",
   "dest_db_host": "10.10.10.133",
   "dest_db_database": "dest_db_name",
-  "pattern": "^lib_.*"
+  "dest_db_user": "dest_user",
+  "pattern": "^lib_.*",
+  "force_restart": false
 }
 ```
 
@@ -70,11 +73,16 @@ python src/table_csv_migration.py --headless config.json
   "suffix": "_v2",
   "db_host": "127.0.0.1",
   "db_database": "source_db_name",
+  "db_user": "root",
   "dest_db_host": "127.0.0.1",
   "dest_db_database": "dest_db_name",
-  "tables": ["lib_users", "lib_address"]
+  "dest_db_user": "root",
+  "tables": ["lib_users", "lib_address"],
+  "force_restart": true
 }
 ```
 
 ## State & Resumption
-If the migration halts due to connection timeout or manual interruption (`Ctrl+C`), do not delete `csv_migration_state.json`. Simply rerun the command or restart the interactive session and select "Yes" when prompted to resume. The tool will automatically skip completed tables and resume CSV loading from the exact byte offset where it stopped.
+If the migration halts due to connection timeout or manual interruption (`Ctrl+C`), do not delete `csv_migration_state.json`. 
+- **Interactive Mode**: Rerun the command or restart the interactive session and select "Yes" when prompted to resume. 
+- **Headless Mode**: The script will automatically detect the state file and resume precisely where it left off. To force a fresh migration and ignore previous progress, add `"force_restart": true` to your `config.json`.

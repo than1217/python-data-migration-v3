@@ -9,6 +9,8 @@ import getpass
 import argparse
 import csv
 import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import mysql.connector
 from tqdm import tqdm
 from mysql.connector import Error
@@ -479,7 +481,7 @@ def _execute_fallback_insert(target_table_name, headers, rows):
         logger.error("Fallback failed to load CSV chunk for '%s': %s", target_table_name, e)
     return False
 
-def load_csv_to_dest(target_table_name, csv_file_path, state):
+def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading=False):
     """Uses LOAD DATA INFILE for the entire CSV, falling back to LOAD DATA LOCAL INFILE in chunks."""
     file_size = os.path.getsize(csv_file_path)
     state.setdefault("csv_load_progress", {})
@@ -491,6 +493,86 @@ def load_csv_to_dest(target_table_name, csv_file_path, state):
     rows_loaded = progress.get("rows_loaded", 0)
 
     t_start = time.time()
+
+    if use_multithreading:
+        logger.info("Loading CSV into destination table '%s' using MULTI-THREADED chunks...", target_table_name)
+        chunk_size = 250000
+        temp_dir = tempfile.gettempdir()
+        
+        def process_multithread_chunk(t_csv, h_list, b_processed):
+            success = _execute_load_data_infile(target_table_name, t_csv, use_local=False)
+            if not success:
+                success = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
+            
+            rows_count = 0
+            if success:
+                with open(t_csv, 'r', encoding='utf-8') as tf:
+                    rows_count = sum(1 for _ in tf) - 1
+            else:
+                logger.info("Falling back to Python mysql.connector for chunk of '%s'...", target_table_name)
+                with open(t_csv, 'r', encoding='utf-8') as tf:
+                    tf.readline()
+                    parsed = list(csv.reader(tf))
+                success = _execute_fallback_insert(target_table_name, h_list, parsed)
+                rows_count = len(parsed)
+                
+            if os.path.exists(t_csv):
+                os.remove(t_csv)
+            return success, rows_count, b_processed
+
+        futures = []
+        executor = ThreadPoolExecutor(max_workers=4)
+        
+        with open(csv_file_path, 'r', encoding='utf-8', newline='') as f:
+            header_line = f.readline()
+            if not header_line:
+                logger.warning("CSV is empty for table '%s'.", target_table_name)
+                state["csv_load_progress"][target_table_name] = {"last_byte_pos": 0, "rows_loaded": 0}
+                return True
+            
+            headers = next(csv.reader([header_line]))
+            
+            while True:
+                chunk_rows = []
+                bytes_processed = 0
+                for _ in range(chunk_size):
+                    line = f.readline()
+                    if not line: break
+                    chunk_rows.append(line)
+                    bytes_processed += len(line.encode('utf-8'))
+                    
+                if not chunk_rows:
+                    break
+                    
+                chunk_id = uuid.uuid4().hex
+                temp_csv = os.path.join(temp_dir, f"{target_table_name}_chunk_{chunk_id}.tmp")
+                with open(temp_csv, 'w', encoding='utf-8', newline='') as tf:
+                    tf.write(header_line)
+                    tf.writelines(chunk_rows)
+                
+                del chunk_rows
+                futures.append(executor.submit(process_multithread_chunk, temp_csv, headers, bytes_processed))
+                
+        total_loaded = 0
+        with tqdm(total=file_size, desc=f"MT Loading {target_table_name}", unit="B", unit_scale=True, leave=False) as pbar:
+            for future in as_completed(futures):
+                success, loaded_count, b_processed = future.result()
+                if not success:
+                    logger.error("A multithreaded chunk failed to load for table '%s'.", target_table_name)
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return False
+                total_loaded += loaded_count
+                pbar.update(b_processed)
+            
+        executor.shutdown(wait=True)
+        
+        state["csv_load_progress"][target_table_name] = {
+            "last_byte_pos": file_size,
+            "rows_loaded": total_loaded
+        }
+        save_state(state)
+        logger.info("Successfully loaded CSV into '%s' via MT in %s.", target_table_name, format_time(time.time() - t_start))
+        return True
 
     if last_byte_pos == 0:
         logger.info("Attempting full LOAD DATA INFILE for '%s'...", target_table_name)
@@ -595,7 +677,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state):
     logger.info("Successfully loaded CSV into '%s' in %s.", target_table_name, format_time(time.time() - t_start))
     return True
 
-def run_migration(tables, state, suffix):
+def run_migration(tables, state, suffix, use_multithreading=False):
     folder_name = suffix.strip('_') if suffix else 'v2'
 
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -673,7 +755,7 @@ def run_migration(tables, state, suffix):
             
             if export_success:
                 # Skip schema drop/create, go straight to appending CSV data
-                if load_csv_to_dest(target_table_name, csv_file, state):
+                if load_csv_to_dest(target_table_name, csv_file, state, use_multithreading):
                     elapsed = format_time(time.time() - t_start)
                     logger.info("Total migration for table '%s' completed in %s.", table, elapsed)
                     successful_migrations += 1
@@ -718,7 +800,7 @@ def run_migration(tables, state, suffix):
                         # 4. Load Schema to destination DB
                         if load_sql_schema(processed_schema):
                             # 5. Load CSV to destination DB
-                            if load_csv_to_dest(target_table_name, csv_file, state):
+                            if load_csv_to_dest(target_table_name, csv_file, state, use_multithreading):
                                 elapsed = format_time(time.time() - t_start)
                                 logger.info("Total migration for table '%s' completed in %s.", table, elapsed)
                                 successful_migrations += 1
@@ -896,8 +978,9 @@ def migration_menu(suffix):
                 if resume != 'y':
                     state = {"migrated_tables": [], "csv_load_progress": {}, "final_row_counts": {}}
                     save_state(state)
+            use_mt = input("Use multi-threaded chunking for faster data loading? (y/n): ").strip().lower() == 'y'
             tables = get_lib_tables(pattern=pattern)
-            run_migration(tables, state, suffix)
+            run_migration(tables, state, suffix, use_multithreading=use_mt)
             
         elif choice == '2':
             tables_input = input("Enter table names separated by commas: ").strip()
@@ -909,8 +992,9 @@ def migration_menu(suffix):
                 if resume != 'y':
                     state = {"migrated_tables": [], "csv_load_progress": {}, "final_row_counts": {}}
                     save_state(state)
+            use_mt = input("Use multi-threaded chunking for faster data loading? (y/n): ").strip().lower() == 'y'
             tables = get_lib_tables(from_list=table_list)
-            run_migration(tables, state, suffix)
+            run_migration(tables, state, suffix, use_multithreading=use_mt)
             
         elif choice == '3':
             break
@@ -969,7 +1053,8 @@ def main():
         else:
             tables = get_lib_tables(pattern=r'^lib_.*')
             
-        run_migration(tables, state, suffix)
+        use_mt = headless_config.get('multithreaded', False)
+        run_migration(tables, state, suffix, use_multithreading=use_mt)
         sys.exit(0)
 
     while True:

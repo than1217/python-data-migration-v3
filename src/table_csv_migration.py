@@ -486,6 +486,8 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
     file_size = os.path.getsize(csv_file_path)
     state.setdefault("csv_load_progress", {})
     
+    is_remote_dest = config.DEST_DB_HOST.lower() not in ['localhost', '127.0.0.1']
+    
     import tempfile
     
     progress = state["csv_load_progress"].get(target_table_name, {})
@@ -495,14 +497,18 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
     t_start = time.time()
 
     if use_multithreading:
-        logger.info("Loading CSV into destination table '%s' using MULTI-THREADED chunks...", target_table_name)
+        logger.info("Loading CSV into destination table '%s' using MULTI-THREADED chunks (Remote dest: %s)...", target_table_name, is_remote_dest)
         chunk_size = 250000
         temp_dir = tempfile.gettempdir()
         
         def process_multithread_chunk(t_csv, h_list, b_processed):
-            success = _execute_load_data_infile(target_table_name, t_csv, use_local=False)
-            if not success:
+            if is_remote_dest:
                 success = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
+            else:
+                success = _execute_load_data_infile(target_table_name, t_csv, use_local=False)
+                if not success:
+                    logger.info("Standard LOAD DATA INFILE failed for '%s'. Falling back to LOCAL INFILE...", target_table_name)
+                    success = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
             
             rows_count = 0
             if success:
@@ -575,8 +581,13 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
         return True
 
     if last_byte_pos == 0:
-        logger.info("Attempting full LOAD DATA INFILE for '%s'...", target_table_name)
-        success = _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
+        if is_remote_dest:
+            logger.info("Destination is remote. Attempting full LOAD DATA LOCAL INFILE for '%s'...", target_table_name)
+            success = _execute_load_data_infile(target_table_name, csv_file_path, use_local=True)
+        else:
+            logger.info("Attempting full LOAD DATA INFILE for '%s'...", target_table_name)
+            success = _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
+            
         if success:
             try:
                 conn = get_db_connection(
@@ -602,9 +613,9 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             logger.info("Successfully loaded full CSV into '%s' in %s.", target_table_name, format_time(time.time() - t_start))
             return True
             
-        logger.info("Full LOAD DATA INFILE failed. Falling back to chunked loading...")
+        logger.info("Full file LOAD DATA attempt failed. Falling back to chunked loading...")
 
-    logger.info("Loading CSV into destination table '%s' in chunks...", target_table_name)
+    logger.info("Loading CSV into destination table '%s' in chunks (Remote dest: %s)...", target_table_name, is_remote_dest)
     chunk_size = 250000
     temp_dir = tempfile.gettempdir()
     temp_csv = os.path.join(temp_dir, f"{target_table_name}_chunk.tmp")
@@ -642,12 +653,15 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                 current_byte_pos = f.tell()
                 bytes_processed = current_byte_pos - last_byte_pos
                 
-                # Try standard LOAD DATA INFILE for the chunk first
-                success = _execute_load_data_infile(target_table_name, temp_csv, use_local=False)
-                
-                if not success:
-                    logger.info("Chunk LOAD DATA INFILE failed for '%s'. Falling back to LOAD DATA LOCAL INFILE...", target_table_name)
+                if is_remote_dest:
                     success = _execute_load_data_infile(target_table_name, temp_csv, use_local=True)
+                else:
+                    # Try standard LOAD DATA INFILE for the chunk first
+                    success = _execute_load_data_infile(target_table_name, temp_csv, use_local=False)
+                    
+                    if not success:
+                        logger.info("Standard LOAD DATA INFILE failed for '%s'. Falling back to LOCAL INFILE...", target_table_name)
+                        success = _execute_load_data_infile(target_table_name, temp_csv, use_local=True)
                 
                 if not success:
                     logger.info("Falling back to Python mysql.connector for chunk of '%s'...", target_table_name)
@@ -875,7 +889,7 @@ def choose_database():
         if conn.is_connected():
             cursor = conn.cursor()
             cursor.execute("SHOW DATABASES")
-            databases = [row[0] for row in cursor.fetchall() if row[0] not in ('information_schema', 'mysql', 'performance_schema', 'sys')]
+            databases = [row[0] for row in cursor.fetchall() if row[0] not in ('information_schema', 'mysql', 'performance_schema', 'sys')] # type: ignore
             cursor.close()
             conn.close()
             

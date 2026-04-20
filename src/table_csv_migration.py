@@ -213,10 +213,27 @@ def process_schema_file(input_file, output_file, table_name, suffix):
             return match.group(1) + " CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci" + rest
 
         column_pattern = re.compile(r'(`[^`]+`\s+(?:varchar\([^)]+\)|char\([^)]+\)|enum\([^)]+\)|set\([^)]+\)|text|longtext|mediumtext|tinytext))([^,\n]*)', flags=re.IGNORECASE)
+        unique_key_pattern = re.compile(r'^\s*UNIQUE KEY.*?(,\n|\n)', flags=re.IGNORECASE)
         
         with open(input_file, 'r', encoding='utf-8') as f_in, open(output_file, 'w', encoding='utf-8') as f_out:
             f_out.write("SET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\n")
-            for line in f_in:
+            lines = f_in.readlines()
+            
+            # First pass: clean up trailing commas on the line before a removed UNIQUE KEY
+            # if the UNIQUE KEY was the last item before the closing parenthesis.
+            cleaned_lines = []
+            for i, line in enumerate(lines):
+                if unique_key_pattern.match(line):
+                    # We are dropping this line.
+                    # Check if it was the last definition line.
+                    if i + 1 < len(lines) and lines[i+1].lstrip().startswith(')'):
+                        # It was the last line, so we need to remove the comma from the previous line if it has one
+                        if cleaned_lines and cleaned_lines[-1].strip().endswith(','):
+                            cleaned_lines[-1] = cleaned_lines[-1].rstrip()[:-1] + '\n'
+                    continue
+                cleaned_lines.append(line)
+
+            for line in cleaned_lines:
                 if f"`{table_name}`" in line:
                     line = table_name_pattern.sub(f"`{new_table_name}`", line)
                 

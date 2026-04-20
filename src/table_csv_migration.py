@@ -493,15 +493,40 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
     progress = state["csv_load_progress"].get(target_table_name, {})
     last_byte_pos = progress.get("last_byte_pos", 0)
     rows_loaded = progress.get("rows_loaded", 0)
+    completed_chunks = progress.get("completed_chunks", [])
 
     t_start = time.time()
+
+    if not use_multithreading and completed_chunks:
+        logger.warning("Multi-threaded progress found but running single-threaded. Truncating table '%s' to avoid duplicates...", target_table_name)
+        try:
+            conn = get_db_connection(
+                host=config.DEST_DB_HOST, user=config.DEST_DB_USER,
+                password=config.DEST_DB_PASSWORD, database=config.DEST_DB_DATABASE
+            )
+            if conn.is_connected():
+                cursor = conn.cursor()
+                cursor.execute(f"TRUNCATE TABLE `{target_table_name}`")
+                conn.commit()
+                cursor.close()
+                conn.close()
+            last_byte_pos = 0
+            rows_loaded = 0
+            completed_chunks = []
+            state["csv_load_progress"][target_table_name] = {"last_byte_pos": 0, "rows_loaded": 0, "completed_chunks": []}
+            save_state(state)
+        except Exception as e:
+            logger.error("Failed to truncate table '%s': %s", target_table_name, e)
+            return False
 
     if use_multithreading:
         logger.info("Loading CSV into destination table '%s' using MULTI-THREADED chunks (Remote dest: %s)...", target_table_name, is_remote_dest)
         chunk_size = 250000
         temp_dir = tempfile.gettempdir()
         
-        def process_multithread_chunk(t_csv, h_list, b_processed):
+        completed_chunks_set = set(completed_chunks)
+        
+        def process_multithread_chunk(t_csv, h_list, b_processed, c_id):
             if is_remote_dest:
                 success = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
             else:
@@ -524,7 +549,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                 
             if os.path.exists(t_csv):
                 os.remove(t_csv)
-            return success, rows_count, b_processed
+            return success, rows_count, b_processed, c_id
 
         futures = []
         executor = ThreadPoolExecutor(max_workers=4)
@@ -533,48 +558,77 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             header_line = f.readline()
             if not header_line:
                 logger.warning("CSV is empty for table '%s'.", target_table_name)
-                state["csv_load_progress"][target_table_name] = {"last_byte_pos": 0, "rows_loaded": 0}
+                state["csv_load_progress"][target_table_name] = {"last_byte_pos": 0, "rows_loaded": 0, "completed_chunks": []}
+                save_state(state)
                 return True
             
             headers = next(csv.reader([header_line]))
             
+            chunk_id = 0
+            bytes_skipped = 0
+            
+            # Bridge for Single-Threaded -> Multi-Threaded resume
+            if last_byte_pos > 0 and not completed_chunks_set:
+                f.seek(last_byte_pos)
+                bytes_skipped = last_byte_pos
+            
             while True:
                 chunk_rows = []
                 bytes_processed = 0
+                
+                is_completed = chunk_id in completed_chunks_set
+                
                 for _ in range(chunk_size):
                     line = f.readline()
                     if not line: break
-                    chunk_rows.append(line)
+                    if not is_completed:
+                        chunk_rows.append(line)
                     bytes_processed += len(line.encode('utf-8'))
                     
-                if not chunk_rows:
+                if bytes_processed == 0:
                     break
                     
-                chunk_id = uuid.uuid4().hex
-                temp_csv = os.path.join(temp_dir, f"{target_table_name}_chunk_{chunk_id}.tmp")
-                with open(temp_csv, 'w', encoding='utf-8', newline='') as tf:
-                    tf.write(header_line)
-                    tf.writelines(chunk_rows)
+                if is_completed:
+                    bytes_skipped += bytes_processed
+                else:
+                    temp_csv = os.path.join(temp_dir, f"{target_table_name}_chunk_{uuid.uuid4().hex}.tmp")
+                    with open(temp_csv, 'w', encoding='utf-8', newline='') as tf:
+                        tf.write(header_line)
+                        tf.writelines(chunk_rows)
+                    
+                    futures.append(executor.submit(process_multithread_chunk, temp_csv, headers, bytes_processed, chunk_id))
+                    
+                chunk_id += 1
                 
-                del chunk_rows
-                futures.append(executor.submit(process_multithread_chunk, temp_csv, headers, bytes_processed))
-                
-        total_loaded = 0
-        with tqdm(total=file_size, desc=f"MT Loading {target_table_name}", unit="B", unit_scale=True, leave=False) as pbar:
+        total_loaded = rows_loaded
+        state_lock = threading.Lock()
+        
+        with tqdm(total=file_size, initial=bytes_skipped, desc=f"MT Loading {target_table_name}", unit="B", unit_scale=True, leave=False) as pbar:
             for future in as_completed(futures):
-                success, loaded_count, b_processed = future.result()
+                success, loaded_count, b_processed, c_id = future.result()
                 if not success:
                     logger.error("A multithreaded chunk failed to load for table '%s'.", target_table_name)
                     executor.shutdown(wait=False, cancel_futures=True)
                     return False
-                total_loaded += loaded_count
+                
+                with state_lock:
+                    total_loaded += loaded_count
+                    completed_chunks_set.add(c_id)
+                    state["csv_load_progress"][target_table_name] = {
+                        "last_byte_pos": bytes_skipped, # Maintain position point for ST bridge
+                        "rows_loaded": total_loaded,
+                        "completed_chunks": list(completed_chunks_set)
+                    }
+                    save_state(state)
+                    
                 pbar.update(b_processed)
             
         executor.shutdown(wait=True)
         
         state["csv_load_progress"][target_table_name] = {
             "last_byte_pos": file_size,
-            "rows_loaded": total_loaded
+            "rows_loaded": total_loaded,
+            "completed_chunks": []
         }
         save_state(state)
         logger.info("Successfully loaded CSV into '%s' via MT in %s.", target_table_name, format_time(time.time() - t_start))

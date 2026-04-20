@@ -782,6 +782,7 @@ def run_migration(tables, state, suffix, use_multithreading=False):
         return
 
     successful_migrations = sum(1 for t in tables if t in state.get("migrated_tables", []))
+    global_skip_extract = None
 
     pbar_main = tqdm(tables, desc="Migrating Tables (CSV)", unit="table", leave=True)
     for table in pbar_main:
@@ -851,7 +852,17 @@ def run_migration(tables, state, suffix, use_multithreading=False):
                     # 3. Export data as CSV or use existing
                     use_existing = False
                     if os.path.exists(csv_file):
-                        choice = input(f"\nExisting CSV file found for '{table}'. Skip extraction and use existing? (y/n): ").strip().lower()
+                        if global_skip_extract is not None:
+                            choice = global_skip_extract
+                        else:
+                            choice = input(f"\nExisting CSV file found for '{table}'. Skip extraction and use existing? (y/n/all-y/all-n): ").strip().lower()
+                            if choice == 'all-y':
+                                global_skip_extract = 'y'
+                                choice = 'y'
+                            elif choice == 'all-n':
+                                global_skip_extract = 'n'
+                                choice = 'n'
+                                
                         if choice == 'y':
                             logger.info("User chose to use existing CSV for '%s'. Skipping extraction.", table)
                             use_existing = True

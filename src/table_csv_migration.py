@@ -746,7 +746,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
     logger.info("Successfully loaded CSV into '%s' in %s.", target_table_name, format_time(time.time() - t_start))
     return True
 
-def run_migration(tables, state, suffix, use_multithreading=False):
+def run_migration(tables, state, suffix, use_multithreading=False, headless_skip_extract=None):
     folder_name = suffix.strip('_') if suffix else 'v2'
 
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -783,7 +783,7 @@ def run_migration(tables, state, suffix, use_multithreading=False):
         return
 
     successful_migrations = sum(1 for t in tables if t in state.get("migrated_tables", []))
-    global_skip_extract = None
+    global_skip_extract = headless_skip_extract
 
     pbar_main = tqdm(tables, desc="Migrating Tables (CSV)", unit="table", leave=True)
     for table in pbar_main:
@@ -1134,7 +1134,16 @@ def main():
             tables = get_lib_tables(pattern=r'^lib_.*')
             
         use_mt = headless_config.get('multithreaded', False)
-        run_migration(tables, state, suffix, use_multithreading=use_mt)
+        
+        # Determine skip_extract preference from config
+        skip_extract_cfg = headless_config.get('skip_extract', None)
+        headless_skip = None
+        if skip_extract_cfg is True:
+            headless_skip = 'y'
+        elif skip_extract_cfg is False:
+            headless_skip = 'n'
+            
+        run_migration(tables, state, suffix, use_multithreading=use_mt, headless_skip_extract=headless_skip)
         sys.exit(0)
 
     while True:

@@ -215,6 +215,7 @@ def process_schema_file(input_file, output_file, table_name, suffix):
         column_pattern = re.compile(r'(`[^`]+`\s+(?:varchar\([^)]+\)|char\([^)]+\)|enum\([^)]+\)|set\([^)]+\)|text|longtext|mediumtext|tinytext))([^,\n]*)', flags=re.IGNORECASE)
         
         with open(input_file, 'r', encoding='utf-8') as f_in, open(output_file, 'w', encoding='utf-8') as f_out:
+            f_out.write("SET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\n")
             for line in f_in:
                 if f"`{table_name}`" in line:
                     line = table_name_pattern.sub(f"`{new_table_name}`", line)
@@ -411,7 +412,7 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
     SET SESSION FOREIGN_KEY_CHECKS=0;
     SET SESSION UNIQUE_CHECKS=0;
     LOAD DATA {local_str}INFILE '{mysql_csv_path}'
-    INTO TABLE `{target_table_name}`
+    IGNORE INTO TABLE `{target_table_name}`
     CHARACTER SET utf8mb4
     FIELDS TERMINATED BY ','
     ENCLOSED BY '"'
@@ -459,7 +460,7 @@ def _execute_fallback_insert(target_table_name, headers, rows):
             
             placeholders = ', '.join(['%s'] * len(headers))
             col_names = ', '.join([f"`{h}`" for h in headers])
-            query = f"INSERT INTO `{target_table_name}` ({col_names}) VALUES ({placeholders})"
+            query = f"INSERT IGNORE INTO `{target_table_name}` ({col_names}) VALUES ({placeholders})"
             
             batch_size = 5000
             batch = []

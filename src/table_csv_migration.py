@@ -780,6 +780,143 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
     logger.info("Successfully loaded CSV into '%s' in %s.", target_table_name, format_time(time.time() - t_start))
     return True
 
+def get_view_ddl(view_name, dest_table_name):
+    """Gets the column definitions from a view and constructs a CREATE TABLE DDL."""
+    logger.info("Getting DDL for view '%s' to create table '%s'", view_name, dest_table_name)
+    try:
+        conn = get_db_connection(
+            host=config.DB_HOST,
+            database=config.DB_DATABASE,
+            user=config.DB_USER,
+            password=config.DB_PASSWORD
+        )
+        if not conn.is_connected():
+            return None
+            
+        cursor = conn.cursor()
+        # Using DESCRIBE which is an alias for SHOW COLUMNS
+        cursor.execute(f"DESCRIBE `{view_name}`")
+        columns = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        if not columns:
+            logger.error("Could not retrieve columns for view '%s'. It might not exist or permissions are missing.", view_name)
+            return None
+
+        col_defs = []
+        string_types = ['varchar', 'char', 'enum', 'set', 'text', 'tinytext', 'mediumtext', 'longtext']
+        
+        for col in columns:
+            col_name, col_type, nullable, key, default, extra = col
+            
+            col_def = f"`{col_name}` {col_type}"
+
+            is_string = any(s_type in col_type.lower() for s_type in string_types)
+            if is_string:
+                col_def += " CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+
+            if nullable == 'NO':
+                col_def += " NOT NULL"
+
+            if default is not None:
+                default_val = default
+                if isinstance(default, (bytes, bytearray)):
+                    default_val = default.decode('utf-8', 'replace')
+                
+                if isinstance(default_val, str):
+                    if default_val.upper() in ["CURRENT_TIMESTAMP", "NULL"]:
+                        col_def += f" DEFAULT {default_val}"
+                    else:
+                        default_val = default_val.replace("'", "''")
+                        col_def += f" DEFAULT '{default_val}'"
+                else:
+                    col_def += f" DEFAULT {default_val}"
+            
+            if extra:
+                col_def += f" {extra}"
+            
+            col_defs.append(col_def)
+        
+        ddl = f"CREATE TABLE IF NOT EXISTS `{dest_table_name}` (\n  " + ",\n  ".join(col_defs) + "\n)"
+        ddl += " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ROW_FORMAT=DYNAMIC;"
+        
+        return f"SET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\n{ddl}\nSET FOREIGN_KEY_CHECKS=1;\nSET UNIQUE_CHECKS=1;\n"
+
+    except Error as e:
+        logger.error("Error getting view DDL for '%s': %s", view_name, e)
+        return None
+
+def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_multithreading=False):
+    """Orchestrates the migration of a single view to a destination table."""
+    t_start_total = time.time()
+    logger.info("Starting migration from view '%s' to table '%s'", view_name, dest_table_name)
+    
+    folder_name = suffix.strip('_') if suffix else 'v2'
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    processed_dir = os.path.join(project_dir, "output", "processed", folder_name)
+    csv_dir = os.path.join(project_dir, "output", "csv", folder_name)
+    os.makedirs(processed_dir, exist_ok=True)
+    os.makedirs(csv_dir, exist_ok=True)
+
+    processed_schema = os.path.join(processed_dir, f"{dest_table_name}_schema.sql")
+    csv_file = os.path.join(csv_dir, f"{dest_table_name}.csv")
+
+    if dest_table_name in state.get("migrated_tables", []):
+        print(f"Skipping '{dest_table_name}', as it's already marked as migrated.")
+        logger.info("Skipping view migration for '%s' as it's already completed.", dest_table_name)
+        return
+
+    csv_load_progress = state.get("csv_load_progress", {}).get(dest_table_name, {})
+    is_resuming = "last_byte_pos" in csv_load_progress and os.path.exists(csv_file)
+
+    if not is_resuming:
+        print(f"\nStarting new migration from view '{view_name}' to table '{dest_table_name}'.")
+        ddl = get_view_ddl(view_name, dest_table_name)
+        if not ddl:
+            print(f"Failed to generate DDL for view '{view_name}'. Check logs.")
+            return
+
+        try:
+            with open(processed_schema, 'w', encoding='utf-8') as f:
+                f.write(ddl)
+        except IOError as e:
+            logger.error("Failed to write schema file %s: %s", processed_schema, e)
+            print(f"Error writing schema file. Check logs.")
+            return
+
+        print(f"Exporting data from view '{view_name}' to CSV...")
+        export_success, _ = export_data_to_csv(view_name, csv_file)
+        if not export_success:
+            print(f"Failed to export data from view '{view_name}'. Check logs.")
+            return
+
+        print(f"Creating table '{dest_table_name}' on destination...")
+        if not load_sql_schema(processed_schema):
+            print(f"Failed to create table '{dest_table_name}'. Check logs.")
+            return
+    else:
+        print(f"\nResuming migration for table '{dest_table_name}'.")
+
+    print(f"Loading data into table '{dest_table_name}'...")
+    if load_csv_to_dest(dest_table_name, csv_file, state, use_multithreading):
+        elapsed = format_time(time.time() - t_start_total)
+        print(f"Successfully migrated view '{view_name}' to table '{dest_table_name}' in {elapsed}.")
+        logger.info("View to table migration for '%s' completed in %s.", dest_table_name, elapsed)
+        
+        if "migrated_tables" not in state:
+            state["migrated_tables"] = []
+        state["migrated_tables"].append(dest_table_name)
+        
+        final_row_count = state.get("csv_load_progress", {}).get(dest_table_name, {}).get("rows_loaded", 0)
+        state.setdefault("final_row_counts", {})[dest_table_name] = final_row_count
+        
+        if dest_table_name in state.get("csv_load_progress", {}):
+            del state["csv_load_progress"][dest_table_name]
+        save_state(state)
+    else:
+        print(f"Failed to load data into table '{dest_table_name}'. Migration incomplete. You can resume later.")
+
 def run_migration(tables, state, suffix, use_multithreading=False, headless_skip_extract=None):
     folder_name = suffix.strip('_') if suffix else 'v2'
 
@@ -1078,10 +1215,11 @@ def migration_menu(suffix):
         print("=============================================")
         print("1. Specify table name pattern (Regular Expression)")
         print("2. Specify exact table names (Comma-separated list)")
-        print("3. Exit / Back to main menu")
+        print("3. Migrate from View to Table")
+        print("4. Exit / Back to main menu")
         print("=============================================")
         
-        choice = input("Select an option (1-3): ").strip()
+        choice = input("Select an option (1-4): ").strip()
         
         if choice == '1':
             pattern = input("Enter regular expression pattern (e.g., '^lib_.*'): ").strip()
@@ -1111,6 +1249,31 @@ def migration_menu(suffix):
             run_migration(tables, state, suffix, use_multithreading=use_mt)
             
         elif choice == '3':
+            view_name = input("Enter source view name: ").strip()
+            if not view_name: continue
+            
+            dest_table_name = input(f"Enter destination table name [{view_name}]: ").strip() or view_name
+            if not dest_table_name: continue
+            
+            dest_table_with_suffix = dest_table_name if dest_table_name.endswith(suffix) else f"{dest_table_name}{suffix}"
+            print(f"The destination table will be named: {dest_table_with_suffix}")
+            
+            state = load_state()
+            if dest_table_with_suffix in state.get("migrated_tables", []) or state.get("csv_load_progress", {}).get(dest_table_with_suffix):
+                 resume = input("\nExisting migration progress found for this table. Resume? (y/n): ").strip().lower()
+                 if resume != 'y':
+                    if dest_table_with_suffix in state.get("migrated_tables", []):
+                        state["migrated_tables"].remove(dest_table_with_suffix)
+                    if dest_table_with_suffix in state.get("csv_load_progress", {}):
+                        del state["csv_load_progress"][dest_table_with_suffix]
+                    if dest_table_with_suffix in state.get("final_row_counts", {}):
+                        del state["final_row_counts"][dest_table_with_suffix]
+                    save_state(state)
+            
+            use_mt = input("Use multi-threaded chunking for faster data loading? (y/n): ").strip().lower() == 'y'
+            run_view_to_table_migration(view_name, dest_table_with_suffix, state, suffix, use_multithreading=use_mt)
+            
+        elif choice == '4':
             break
 
 def main():

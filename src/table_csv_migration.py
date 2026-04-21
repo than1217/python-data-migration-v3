@@ -842,7 +842,10 @@ def get_view_ddl(view_name, dest_table_name):
                     col_def += f" DEFAULT {default_val}"
             
             if extra:
-                col_def += f" {extra}"
+                # Filter out unsupported 'DEFAULT_GENERATED' from view descriptions
+                clean_extra = re.sub(r'DEFAULT_GENERATED', '', extra, flags=re.IGNORECASE).strip()
+                if clean_extra:
+                    col_def += f" {clean_extra}"
             
             col_defs.append(col_def)
         

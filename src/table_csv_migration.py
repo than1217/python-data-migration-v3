@@ -424,8 +424,15 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
     
     logger.info("Executing LOAD DATA %sINFILE for '%s'", local_str, target_table_name)
     
-    sql_command = f"""
-    SET SESSION sql_mode='';
+    import tempfile
+    retries = MAX_RETRIES if use_local else 1
+    attempt = 1
+    disable_log_bin = True
+    
+    while attempt <= retries:
+        log_bin_stmt = "SET SESSION sql_log_bin=0;\n    " if disable_log_bin else ""
+        sql_command = f"""
+    {log_bin_stmt}SET SESSION sql_mode='';
     SET SESSION FOREIGN_KEY_CHECKS=0;
     SET SESSION UNIQUE_CHECKS=0;
     LOAD DATA {local_str}INFILE '{mysql_csv_path}'
@@ -437,10 +444,7 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
     LINES TERMINATED BY '\\r\\n'
     IGNORE 1 LINES;
     """
-    
-    import tempfile
-    retries = MAX_RETRIES if use_local else 1
-    for attempt in range(1, retries + 1):
+        
         with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as err_file:
             try:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err_file, text=True)
@@ -451,13 +455,21 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
                 else:
                     err_file.seek(0)
                     error_msg = err_file.read()
+                    
+                    if disable_log_bin and any(k in error_msg for k in ["SUPER", "SYSTEM_VARIABLES_ADMIN", "sql_log_bin", "Access denied"]):
+                        logger.warning("Permission denied to disable sql_log_bin. Retrying with log bin enabled for '%s'.", target_table_name)
+                        disable_log_bin = False
+                        continue
+                        
                     logger.error("Attempt %s/%s failed to load CSV for '%s' (local=%s): %s", attempt, retries, target_table_name, use_local, error_msg)
                     if attempt < retries:
                         time.sleep(RETRY_DELAY)
+                    attempt += 1
             except Exception as e:
                 logger.error("Attempt %s/%s unexpected error loading CSV for '%s' (local=%s): %s", attempt, retries, target_table_name, use_local, e)
                 if attempt < retries:
                     time.sleep(RETRY_DELAY)
+                attempt += 1
     return False
 
 def _execute_fallback_insert(target_table_name, headers, rows):
@@ -471,6 +483,11 @@ def _execute_fallback_insert(target_table_name, headers, rows):
         )
         if conn.is_connected():
             cursor = conn.cursor()
+            try:
+                cursor.execute("SET SESSION sql_log_bin=0")
+            except Error as e:
+                logger.warning("Permission denied to disable sql_log_bin in fallback insert for '%s'. Proceeding with log bin enabled.", target_table_name)
+                
             cursor.execute("SET SESSION sql_mode=''")
             cursor.execute("SET SESSION FOREIGN_KEY_CHECKS=0")
             cursor.execute("SET SESSION UNIQUE_CHECKS=0")

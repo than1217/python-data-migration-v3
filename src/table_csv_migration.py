@@ -524,6 +524,36 @@ def _execute_fallback_insert(target_table_name, headers, rows):
         logger.error("Fallback failed to load CSV chunk for '%s': %s", target_table_name, e)
     return False
 
+def _process_csv_chunk(target_table_name, t_csv, h_list, is_remote_dest):
+    """Processes a single CSV chunk, trying different loading methods."""
+    if is_remote_dest:
+        success = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
+    else:
+        success = _execute_load_data_infile(target_table_name, t_csv, use_local=False)
+        if not success:
+            logger.info("Standard LOAD DATA INFILE failed for chunk of '%s'. Falling back to LOCAL INFILE...", target_table_name)
+            success = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
+    
+    rows_count = 0
+    if success:
+        try:
+            with open(t_csv, 'r', encoding='utf-8') as tf:
+                rows_count = sum(1 for _ in tf) - 1
+        except Exception:
+            pass
+    else:
+        logger.info("Falling back to Python mysql.connector for chunk of '%s'...", target_table_name)
+        with open(t_csv, 'r', encoding='utf-8') as tf:
+            tf.readline()
+            parsed = list(csv.reader(tf))
+        if _execute_fallback_insert(target_table_name, h_list, parsed):
+            success = True
+            rows_count = len(parsed)
+        
+    if os.path.exists(t_csv):
+        os.remove(t_csv)
+    return success, rows_count
+
 def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading=False):
     """Uses LOAD DATA INFILE for the entire CSV, falling back to LOAD DATA LOCAL INFILE in chunks."""
     file_size = os.path.getsize(csv_file_path)
@@ -569,29 +599,9 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
         
         completed_chunks_set = set(completed_chunks)
         
-        def process_multithread_chunk(t_csv, h_list, b_processed, c_id):
-            if is_remote_dest:
-                success = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
-            else:
-                success = _execute_load_data_infile(target_table_name, t_csv, use_local=False)
-                if not success:
-                    logger.info("Standard LOAD DATA INFILE failed for '%s'. Falling back to LOCAL INFILE...", target_table_name)
-                    success = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
-            
-            rows_count = 0
-            if success:
-                with open(t_csv, 'r', encoding='utf-8') as tf:
-                    rows_count = sum(1 for _ in tf) - 1
-            else:
-                logger.info("Falling back to Python mysql.connector for chunk of '%s'...", target_table_name)
-                with open(t_csv, 'r', encoding='utf-8') as tf:
-                    tf.readline()
-                    parsed = list(csv.reader(tf))
-                success = _execute_fallback_insert(target_table_name, h_list, parsed)
-                rows_count = len(parsed)
-                
-            if os.path.exists(t_csv):
-                os.remove(t_csv)
+        def process_wrapper(t_csv, h_list, b_processed, c_id):
+            """Wrapper to call the shared chunk processor and return values needed for futures."""
+            success, rows_count = _process_csv_chunk(target_table_name, t_csv, h_list, is_remote_dest)
             return success, rows_count, b_processed, c_id
 
         futures = []
@@ -610,7 +620,6 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             chunk_id = 0
             bytes_skipped = 0
             
-            # Bridge for Single-Threaded -> Multi-Threaded resume
             if last_byte_pos > 0 and not completed_chunks_set:
                 f.seek(last_byte_pos)
                 bytes_skipped = last_byte_pos
@@ -618,7 +627,6 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             while True:
                 chunk_rows = []
                 bytes_processed = 0
-                
                 is_completed = chunk_id in completed_chunks_set
                 
                 for _ in range(chunk_size):
@@ -638,8 +646,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                     with open(temp_csv, 'w', encoding='utf-8', newline='') as tf:
                         tf.write(header_line)
                         tf.writelines(chunk_rows)
-                    
-                    futures.append(executor.submit(process_multithread_chunk, temp_csv, headers, bytes_processed, chunk_id))
+                    futures.append(executor.submit(process_wrapper, temp_csv, headers, bytes_processed, chunk_id))
                     
                 chunk_id += 1
                 
@@ -658,12 +665,11 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                     total_loaded += loaded_count
                     completed_chunks_set.add(c_id)
                     state["csv_load_progress"][target_table_name] = {
-                        "last_byte_pos": bytes_skipped, # Maintain position point for ST bridge
+                        "last_byte_pos": bytes_skipped,
                         "rows_loaded": total_loaded,
                         "completed_chunks": list(completed_chunks_set)
                     }
                     save_state(state)
-                    
                 pbar.update(b_processed)
             
         executor.shutdown(wait=True)
@@ -715,7 +721,6 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
     logger.info("Loading CSV into destination table '%s' in chunks (Remote dest: %s)...", target_table_name, is_remote_dest)
     chunk_size = 250000
     temp_dir = tempfile.gettempdir()
-    temp_csv = os.path.join(temp_dir, f"{target_table_name}_chunk.tmp")
     
     with open(csv_file_path, 'r', encoding='utf-8', newline='') as f:
         header_line = f.readline()
@@ -743,6 +748,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                 if not chunk_rows:
                     break
                     
+                temp_csv = os.path.join(temp_dir, f"{target_table_name}_chunk_{uuid.uuid4().hex}.tmp")
                 with open(temp_csv, 'w', encoding='utf-8', newline='') as tf:
                     tf.write(header_line)
                     tf.writelines(chunk_rows)
@@ -750,28 +756,13 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                 current_byte_pos = f.tell()
                 bytes_processed = current_byte_pos - last_byte_pos
                 
-                if is_remote_dest:
-                    success = _execute_load_data_infile(target_table_name, temp_csv, use_local=True)
-                else:
-                    # Try standard LOAD DATA INFILE for the chunk first
-                    success = _execute_load_data_infile(target_table_name, temp_csv, use_local=False)
-                    
-                    if not success:
-                        logger.info("Standard LOAD DATA INFILE failed for '%s'. Falling back to LOCAL INFILE...", target_table_name)
-                        success = _execute_load_data_infile(target_table_name, temp_csv, use_local=True)
-                
-                if not success:
-                    logger.info("Falling back to Python mysql.connector for chunk of '%s'...", target_table_name)
-                    parsed_rows = list(csv.reader(chunk_rows))
-                    success = _execute_fallback_insert(target_table_name, headers, parsed_rows)
+                success, loaded_count = _process_csv_chunk(target_table_name, temp_csv, headers, is_remote_dest)
                     
                 if not success:
                     logger.error("Failed to load chunk for table '%s'.", target_table_name)
-                    if os.path.exists(temp_csv):
-                        os.remove(temp_csv)
                     return False
                     
-                rows_loaded += len(chunk_rows)
+                rows_loaded += loaded_count
                 last_byte_pos = current_byte_pos
                 
                 state["csv_load_progress"][target_table_name] = {
@@ -782,9 +773,6 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                 
                 pbar.update(bytes_processed)
 
-    if os.path.exists(temp_csv):
-        os.remove(temp_csv)
-        
     logger.info("Successfully loaded CSV into '%s' in %s.", target_table_name, format_time(time.time() - t_start))
     return True
 
@@ -896,8 +884,23 @@ def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_m
             print(f"Error writing schema file. Check logs.")
             return
 
-        print(f"Exporting data from view '{view_name}' to CSV...")
-        export_success, _ = export_data_to_csv(view_name, csv_file)
+        use_existing_csv = False
+        if os.path.exists(csv_file):
+            choice = input(f"\nExisting CSV file found for '{view_name}'. Skip extraction and use existing? (y/n): ").strip().lower()
+            if choice == 'y':
+                logger.info("User chose to use existing CSV for '%s'. Skipping extraction.", view_name)
+                use_existing_csv = True
+            else:
+                logger.info("User chose to re-extract CSV for '%s'.", view_name)
+        
+        export_success = False
+        if use_existing_csv:
+            export_success = True
+            print(f"Using existing CSV file for '{view_name}'.")
+        else:
+            print(f"Exporting data from view '{view_name}' to CSV...")
+            export_success, _ = export_data_to_csv(view_name, csv_file)
+
         if not export_success:
             print(f"Failed to export data from view '{view_name}'. Check logs.")
             return

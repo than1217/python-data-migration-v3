@@ -846,6 +846,26 @@ def get_view_ddl(view_name, dest_table_name):
         logger.error("Error getting view DDL for '%s': %s", view_name, e)
         return None
 
+def get_ddl_content(filepath):
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return ""
+
+def write_summary_csv(summary_csv_path, summary_data):
+    """Writes summary data to a CSV file, overwriting it."""
+    try:
+        with open(summary_csv_path, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['table_name', 'total_migration', 'ddl_sql', 'total_rows', 'remarks'])
+            writer.writerows(summary_data)
+        logger.info("Summary CSV successfully generated at '%s'", summary_csv_path)
+    except Exception as e:
+        logger.error("Failed to write summary CSV: %s", e)
+
 def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_multithreading=False):
     """Orchestrates the migration of a single view to a destination table."""
     t_start_total = time.time()
@@ -858,78 +878,101 @@ def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_m
     os.makedirs(processed_dir, exist_ok=True)
     os.makedirs(csv_dir, exist_ok=True)
 
+    summary_csv_path = os.path.join(project_dir, "output", f"migration_summary_{folder_name}.csv")
     processed_schema = os.path.join(processed_dir, f"{dest_table_name}_schema.sql")
     csv_file = os.path.join(csv_dir, f"{dest_table_name}.csv")
 
-    if dest_table_name in state.get("migrated_tables", []):
-        print(f"Skipping '{dest_table_name}', as it's already marked as migrated.")
-        logger.info("Skipping view migration for '%s' as it's already completed.", dest_table_name)
-        return
+    remarks = "Unknown"
 
-    csv_load_progress = state.get("csv_load_progress", {}).get(dest_table_name, {})
-    is_resuming = "last_byte_pos" in csv_load_progress and os.path.exists(csv_file)
-
-    if not is_resuming:
-        print(f"\nStarting new migration from view '{view_name}' to table '{dest_table_name}'.")
-        ddl = get_view_ddl(view_name, dest_table_name)
-        if not ddl:
-            print(f"Failed to generate DDL for view '{view_name}'. Check logs.")
+    try:
+        if dest_table_name in state.get("migrated_tables", []):
+            print(f"Skipping '{dest_table_name}', as it's already marked as migrated.")
+            logger.info("Skipping view migration for '%s' as it's already completed.", dest_table_name)
+            remarks = "Success (Already migrated)"
             return
 
-        try:
-            with open(processed_schema, 'w', encoding='utf-8') as f:
-                f.write(ddl)
-        except IOError as e:
-            logger.error("Failed to write schema file %s: %s", processed_schema, e)
-            print(f"Error writing schema file. Check logs.")
-            return
+        csv_load_progress = state.get("csv_load_progress", {}).get(dest_table_name, {})
+        is_resuming = "last_byte_pos" in csv_load_progress and os.path.exists(csv_file)
 
-        use_existing_csv = False
-        if os.path.exists(csv_file):
-            choice = input(f"\nExisting CSV file found for '{view_name}'. Skip extraction and use existing? (y/n): ").strip().lower()
-            if choice == 'y':
-                logger.info("User chose to use existing CSV for '%s'. Skipping extraction.", view_name)
-                use_existing_csv = True
+        if not is_resuming:
+            print(f"\nStarting new migration from view '{view_name}' to table '{dest_table_name}'.")
+            ddl = get_view_ddl(view_name, dest_table_name)
+            if not ddl:
+                print(f"Failed to generate DDL for view '{view_name}'. Check logs.")
+                remarks = "Failed: DDL Generation"
+                return
+
+            try:
+                with open(processed_schema, 'w', encoding='utf-8') as f:
+                    f.write(ddl)
+                logger.info("Successfully generated DDL for view '%s'.", view_name)
+            except IOError as e:
+                logger.error("Failed to write schema file %s: %s", processed_schema, e)
+                print(f"Error writing schema file. Check logs.")
+                remarks = "Failed: Write DDL to file"
+                return
+
+            use_existing_csv = False
+            if os.path.exists(csv_file):
+                choice = input(f"\nExisting CSV file found for '{view_name}'. Skip extraction and use existing? (y/n): ").strip().lower()
+                if choice == 'y':
+                    logger.info("User chose to use existing CSV for '%s'. Skipping extraction.", view_name)
+                    use_existing_csv = True
+                else:
+                    logger.info("User chose to re-extract CSV for '%s'.", view_name)
+            
+            export_success = False
+            if use_existing_csv:
+                export_success = True
+                print(f"Using existing CSV file for '{view_name}'.")
             else:
-                logger.info("User chose to re-extract CSV for '%s'.", view_name)
-        
-        export_success = False
-        if use_existing_csv:
-            export_success = True
-            print(f"Using existing CSV file for '{view_name}'.")
+                print(f"Exporting data from view '{view_name}' to CSV...")
+                export_success, _ = export_data_to_csv(view_name, csv_file)
+
+            if not export_success:
+                print(f"Failed to export data from view '{view_name}'. Check logs.")
+                remarks = "Failed: Export data to CSV"
+                return
+
+            print(f"Creating table '{dest_table_name}' on destination...")
+            if not load_sql_schema(processed_schema):
+                print(f"Failed to create table '{dest_table_name}'. Check logs.")
+                remarks = "Failed: Execute schema in destination"
+                return
         else:
-            print(f"Exporting data from view '{view_name}' to CSV...")
-            export_success, _ = export_data_to_csv(view_name, csv_file)
+            print(f"\nResuming migration for table '{dest_table_name}'.")
 
-        if not export_success:
-            print(f"Failed to export data from view '{view_name}'. Check logs.")
-            return
+        print(f"Loading data into table '{dest_table_name}'...")
+        if load_csv_to_dest(dest_table_name, csv_file, state, use_multithreading):
+            elapsed_str = format_time(time.time() - t_start_total)
+            print(f"Successfully migrated view '{view_name}' to table '{dest_table_name}' in {elapsed_str}.")
+            logger.info("View to table migration for '%s' completed in %s.", dest_table_name, elapsed_str)
+            
+            if "migrated_tables" not in state:
+                state["migrated_tables"] = []
+            state["migrated_tables"].append(dest_table_name)
+            
+            final_row_count = state.get("csv_load_progress", {}).get(dest_table_name, {}).get("rows_loaded", 0)
+            state.setdefault("final_row_counts", {})[dest_table_name] = final_row_count
+            
+            if dest_table_name in state.get("csv_load_progress", {}):
+                del state["csv_load_progress"][dest_table_name]
+            save_state(state)
+            remarks = "Success"
+        else:
+            print(f"Failed to load data into table '{dest_table_name}'. Migration incomplete. You can resume later.")
+            remarks = "Failed: Load CSV to destination"
 
-        print(f"Creating table '{dest_table_name}' on destination...")
-        if not load_sql_schema(processed_schema):
-            print(f"Failed to create table '{dest_table_name}'. Check logs.")
-            return
-    else:
-        print(f"\nResuming migration for table '{dest_table_name}'.")
-
-    print(f"Loading data into table '{dest_table_name}'...")
-    if load_csv_to_dest(dest_table_name, csv_file, state, use_multithreading):
+    finally:
         elapsed = format_time(time.time() - t_start_total)
-        print(f"Successfully migrated view '{view_name}' to table '{dest_table_name}' in {elapsed}.")
-        logger.info("View to table migration for '%s' completed in %s.", dest_table_name, elapsed)
+        ddl_content = get_ddl_content(processed_schema)
+        final_row_count = state.get("final_row_counts", {}).get(dest_table_name, 0)
+        if final_row_count == 0:
+            final_row_count = state.get("csv_load_progress", {}).get(dest_table_name, {}).get("rows_loaded", 0)
         
-        if "migrated_tables" not in state:
-            state["migrated_tables"] = []
-        state["migrated_tables"].append(dest_table_name)
-        
-        final_row_count = state.get("csv_load_progress", {}).get(dest_table_name, {}).get("rows_loaded", 0)
-        state.setdefault("final_row_counts", {})[dest_table_name] = final_row_count
-        
-        if dest_table_name in state.get("csv_load_progress", {}):
-            del state["csv_load_progress"][dest_table_name]
-        save_state(state)
-    else:
-        print(f"Failed to load data into table '{dest_table_name}'. Migration incomplete. You can resume later.")
+        summary_data = [[dest_table_name, elapsed, ddl_content, final_row_count, remarks]]
+        write_summary_csv(summary_csv_path, summary_data)
+        logger.info("View migration summary for '%s' generated with status: %s", dest_table_name, remarks)
 
 def run_migration(tables, state, suffix, use_multithreading=False, headless_skip_extract=None):
     folder_name = suffix.strip('_') if suffix else 'v2'
@@ -945,15 +988,6 @@ def run_migration(tables, state, suffix, use_multithreading=False, headless_skip
 
     summary_csv_path = os.path.join(project_dir, "output", f"migration_summary_{folder_name}.csv")
     summary_data = []
-
-    def get_ddl_content(filepath):
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    return f.read().strip()
-            except Exception:
-                pass
-        return ""
 
     if not tables:
         print("No tables found to migrate.")
@@ -1109,14 +1143,7 @@ def run_migration(tables, state, suffix, use_multithreading=False, headless_skip
     logger.info(summary)
     
     # Write summary CSV
-    try:
-        with open(summary_csv_path, 'w', encoding='utf-8', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['table_name', 'total_migration', 'ddl_sql', 'total_rows', 'remarks'])
-            writer.writerows(summary_data)
-        logger.info("Summary CSV successfully generated at '%s'", summary_csv_path)
-    except Exception as e:
-        logger.error("Failed to write summary CSV: %s", e)
+    write_summary_csv(summary_csv_path, summary_data)
     
     if successful_migrations == len(tables):
         logger.info("All tables migrated successfully. Resetting migration state.")

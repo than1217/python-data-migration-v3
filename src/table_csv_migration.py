@@ -653,13 +653,15 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
         total_loaded = rows_loaded
         state_lock = threading.Lock()
         
+        multithread_failed = False
         with tqdm(total=file_size, initial=bytes_skipped, desc=f"MT Loading {target_table_name}", unit="B", unit_scale=True, leave=False) as pbar:
             for future in as_completed(futures):
                 success, loaded_count, b_processed, c_id = future.result()
                 if not success:
                     logger.error("A multithreaded chunk failed to load for table '%s'.", target_table_name)
                     executor.shutdown(wait=False, cancel_futures=True)
-                    return False
+                    multithread_failed = True
+                    break
                 
                 with state_lock:
                     total_loaded += loaded_count
@@ -671,17 +673,43 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                     }
                     save_state(state)
                 pbar.update(b_processed)
-            
-        executor.shutdown(wait=True)
         
-        state["csv_load_progress"][target_table_name] = {
-            "last_byte_pos": file_size,
-            "rows_loaded": total_loaded,
-            "completed_chunks": []
-        }
-        save_state(state)
-        logger.info("Successfully loaded CSV into '%s' via MT in %s.", target_table_name, format_time(time.time() - t_start))
-        return True
+        executor.shutdown(wait=True)
+
+        if not multithread_failed:
+            state["csv_load_progress"][target_table_name] = {
+                "last_byte_pos": file_size,
+                "rows_loaded": total_loaded,
+                "completed_chunks": []
+            }
+            save_state(state)
+            logger.info("Successfully loaded CSV into '%s' via MT in %s.", target_table_name, format_time(time.time() - t_start))
+            return True
+        else:
+            logger.warning("Multithreaded load for '%s' failed. Falling back to single-threaded mode.", target_table_name)
+            try:
+                conn = get_db_connection(
+                    host=config.DEST_DB_HOST, user=config.DEST_DB_USER,
+                    password=config.DEST_DB_PASSWORD, database=config.DEST_DB_DATABASE
+                )
+                if conn.is_connected():
+                    cursor = conn.cursor()
+                    cursor.execute(f"TRUNCATE TABLE `{target_table_name}`")
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
+                    logger.info("Truncated table '%s' for single-threaded retry.", target_table_name)
+
+                # Reset progress for single-threaded mode
+                state["csv_load_progress"][target_table_name] = {"last_byte_pos": 0, "rows_loaded": 0, "completed_chunks": []}
+                save_state(state)
+                last_byte_pos = 0
+                rows_loaded = 0
+                completed_chunks = []
+
+            except Exception as e:
+                logger.error("Failed to truncate table '%s' for retry: %s", target_table_name, e)
+                return False
 
     if last_byte_pos == 0:
         if is_remote_dest:

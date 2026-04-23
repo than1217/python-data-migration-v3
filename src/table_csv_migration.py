@@ -383,7 +383,7 @@ def export_data_to_csv(table_name, csv_file_path):
         logger.error("Error exporting to CSV for table '%s': %s", table_name, e)
         return False, 0
     finally:
-        if conn and conn.is_connected():
+        if conn:
             conn.close()
 
 def create_destination_db():

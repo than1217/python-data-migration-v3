@@ -354,11 +354,13 @@ def export_data_to_csv(table_name, csv_file_path):
                             logger.warning("No suitable single-column integer PK found for '%s'. Using non-chunked streaming. This may fail on large tables.", table_name)
                         
                         try:
-                            # Set a 2-minute timeout on the main cursor for this session
-                            cursor.execute("SET SESSION max_execution_time = 120000")
-                            logger.info("Set session max_execution_time to 2 minutes for streaming export.")
+                            # Increase network timeouts to prevent "Lost connection" (Error 2013) 
+                            # while waiting for complex views to compute.
+                            cursor.execute("SET SESSION net_read_timeout = 3600")
+                            cursor.execute("SET SESSION net_write_timeout = 3600")
+                            logger.info("Set session net_read_timeout and net_write_timeout to 3600 seconds for streaming export.")
                         except mysql.connector.Error as err:
-                            logger.warning("Could not set max_execution_time: %s. The server's default timeout will be used.", err)
+                            logger.warning("Could not set network timeouts: %s. The server's default timeout will be used.", err)
 
                         with conn.cursor(buffered=False) as unbuffered_cursor:
                             unbuffered_cursor.execute(f"SELECT * FROM `{table_name}`")

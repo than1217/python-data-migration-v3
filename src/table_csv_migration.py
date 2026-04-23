@@ -273,7 +273,7 @@ def export_data_to_csv(table_name, csv_file_path):
             charset='utf8mb4'
         )
 
-        with conn.cursor() as cursor:
+        with conn.cursor(buffered=True) as cursor:
             # Determine if it's a table or a view
             cursor.execute(f"SELECT TABLE_TYPE FROM information_schema.tables WHERE table_schema = '{config.DB_DATABASE}' AND table_name = '{table_name}'")
             table_type_result = cursor.fetchone()

@@ -346,33 +346,35 @@ def export_data_to_csv(table_name, csv_file_path):
                         else:
                             logger.info("Table '%s' appears empty despite row count. Exporting headers only.", table_name)
 
-                    # --- Fallback to original streaming method for views or tables without a good PK ---
+                    # --- Fallback to pagination (LIMIT/OFFSET) for views or tables without a good PK ---
                     else:
                         if is_view:
-                            logger.info("'%s' is a view, using non-chunked streaming export.", table_name)
+                            logger.info("'%s' is a view, using LIMIT/OFFSET pagination export.", table_name)
                         else:
-                            logger.warning("No suitable single-column integer PK found for '%s'. Using non-chunked streaming. This may fail on large tables.", table_name)
+                            logger.warning("No suitable single-column integer PK found for '%s'. Using LIMIT/OFFSET pagination. This prevents timeouts on large tables.", table_name)
                         
-                        try:
-                            # Increase network timeouts to prevent "Lost connection" (Error 2013) 
-                            # while waiting for complex views to compute.
-                            cursor.execute("SET SESSION net_read_timeout = 3600")
-                            cursor.execute("SET SESSION net_write_timeout = 3600")
-                            logger.info("Set session net_read_timeout and net_write_timeout to 3600 seconds for streaming export.")
-                        except mysql.connector.Error as err:
-                            logger.warning("Could not set network timeouts: %s. The server's default timeout will be used.", err)
-
-                        with conn.cursor(buffered=False) as unbuffered_cursor:
-                            unbuffered_cursor.execute(f"SELECT * FROM `{table_name}`")
-                            
-                            batch_size = 10000
-                            while True:
-                                rows = unbuffered_cursor.fetchmany(batch_size)
+                        chunk_size = 50000
+                        offset = 0
+                        
+                        while True:
+                            with conn.cursor(buffered=True) as chunk_cursor:
+                                # Execute a fresh query for each chunk to prevent long-running connection drops
+                                query = f"SELECT * FROM `{table_name}` LIMIT {chunk_size} OFFSET {offset}"
+                                chunk_cursor.execute(query)
+                                rows = chunk_cursor.fetchall()
+                                
                                 if not rows:
                                     break
+                                    
                                 writer.writerows(rows)
-                                exact_row_count += len(rows)
-                                pbar.update(len(rows))
+                                rows_fetched = len(rows)
+                                exact_row_count += rows_fetched
+                                pbar.update(rows_fetched)
+                                
+                                if rows_fetched < chunk_size:
+                                    break
+                                    
+                                offset += chunk_size
 
         logger.info("Successfully exported %d rows from '%s' to CSV in %s.", exact_row_count, table_name, format_time(time.time() - t_start))
         return True, exact_row_count

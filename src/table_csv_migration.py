@@ -263,6 +263,7 @@ def export_data_to_csv(table_name, csv_file_path):
        Uses Primary Key chunking (pagination) to prevent memory spikes and query timeouts on large tables."""
     logger.info("Exporting data from '%s' to CSV...", table_name)
     t_start = time.time()
+    conn = None
     try:
         conn = get_db_connection(
             host=config.DB_HOST,
@@ -271,113 +272,105 @@ def export_data_to_csv(table_name, csv_file_path):
             database=config.DB_DATABASE,
             charset='utf8mb4'
         )
-        if not conn.is_connected():
-            logger.error("Could not connect to database for CSV export.")
-            return False, 0
 
-        cursor = conn.cursor()
+        with conn.cursor() as cursor:
+            # Determine if it's a table or a view
+            cursor.execute(f"SELECT TABLE_TYPE FROM information_schema.tables WHERE table_schema = '{config.DB_DATABASE}' AND table_name = '{table_name}'")
+            table_type_result = cursor.fetchone()
+            is_view = table_type_result and table_type_result[0].upper() == 'VIEW'
 
-        # Determine if it's a table or a view
-        cursor.execute(f"SELECT TABLE_TYPE FROM information_schema.tables WHERE table_schema = '{config.DB_DATABASE}' AND table_name = '{table_name}'")
-        table_type_result = cursor.fetchone()
-        is_view = table_type_result and table_type_result[0].upper() == 'VIEW'
-
-        # Get total rows for progress bar
-        total_rows = 0
-        if not is_view:
-            try:
-                # Use approximate count for speed, but verify with COUNT(*) if needed
-                cursor.execute(f"SELECT TABLE_ROWS FROM information_schema.tables WHERE table_schema = '{config.DB_DATABASE}' AND table_name = '{table_name}'")
-                row = cursor.fetchone()
-                total_rows = int(row[0]) if row and row[0] is not None else 0
-                if total_rows == 0:
-                    cursor.execute(f"SELECT COUNT(*) FROM `{table_name}`")
-                    total_rows = cursor.fetchone()[0]
-            except Error as e:
-                logger.warning("Could not determine row count for '%s': %s. Progress bar may be inaccurate.", table_name, e)
-                total_rows = None # For indeterminate progress bar
-        
-        desc = f"Exporting CSV {table_name}"
-        with open(csv_file_path, 'w', encoding='utf-8', newline='') as f:
-            writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
-            
-            # Write headers
-            cursor.execute(f"SELECT * FROM `{table_name}` LIMIT 0")
-            headers = [i[0] for i in cursor.description] if cursor.description else []
-            writer.writerow(headers)
-            
-            if total_rows == 0 and not is_view:
-                logger.info("Table '%s' is empty. Exported headers only.", table_name)
-                cursor.close()
-                conn.close()
-                return True, 0
-
-            # Check for a suitable primary key for chunking
-            pk_col_name = None
+            # Get total rows for progress bar
+            total_rows = 0
             if not is_view:
-                cursor.execute(f"SHOW COLUMNS FROM `{table_name}` WHERE `Key` = 'PRI'")
-                pk_cols = cursor.fetchall()
-                if len(pk_cols) == 1 and 'int' in pk_cols[0][1]:
-                    pk_col_name = pk_cols[0][0]
+                try:
+                    # Use approximate count for speed, but verify with COUNT(*) if needed
+                    cursor.execute(f"SELECT TABLE_ROWS FROM information_schema.tables WHERE table_schema = '{config.DB_DATABASE}' AND table_name = '{table_name}'")
+                    row = cursor.fetchone()
+                    total_rows = int(row[0]) if row and row[0] is not None else 0
+                    if total_rows == 0:
+                        cursor.execute(f"SELECT COUNT(*) FROM `{table_name}`")
+                        total_rows = cursor.fetchone()[0]
+                except Error as e:
+                    logger.warning("Could not determine row count for '%s': %s. Progress bar may be inaccurate.", table_name, e)
+                    total_rows = None # For indeterminate progress bar
             
-            exact_row_count = 0
-            with tqdm(total=total_rows, desc=desc, unit="row", leave=False) as pbar:
-                # --- PK Chunking Logic ---
-                if pk_col_name:
-                    logger.info("Using Primary Key chunking for export of table '%s' on column '%s'.", table_name, pk_col_name)
-                    cursor.execute(f"SELECT MIN(`{pk_col_name}`), MAX(`{pk_col_name}`) FROM `{table_name}`")
-                    min_pk, max_pk = cursor.fetchone()
+            desc = f"Exporting CSV {table_name}"
+            with open(csv_file_path, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
+                
+                # Write headers
+                cursor.execute(f"SELECT * FROM `{table_name}` LIMIT 0")
+                headers = [i[0] for i in cursor.description] if cursor.description else []
+                writer.writerow(headers)
+                
+                if total_rows == 0 and not is_view:
+                    logger.info("Table '%s' is empty. Exported headers only.", table_name)
+                    return True, 0
 
-                    if min_pk is not None and max_pk is not None:
-                        chunk_size = 50000
-                        current_pk = min_pk
-                        
-                        unbuffered_cursor = conn.cursor(buffered=False)
-                        while current_pk <= max_pk:
-                            query = f"SELECT * FROM `{table_name}` WHERE `{pk_col_name}` >= {current_pk} AND `{pk_col_name}` < {current_pk + chunk_size}"
-                            unbuffered_cursor.execute(query)
+                # Check for a suitable primary key for chunking
+                pk_col_name = None
+                if not is_view:
+                    cursor.execute(f"SHOW COLUMNS FROM `{table_name}` WHERE `Key` = 'PRI'")
+                    pk_cols = cursor.fetchall()
+                    if len(pk_cols) == 1 and 'int' in pk_cols[0][1]:
+                        pk_col_name = pk_cols[0][0]
+                
+                exact_row_count = 0
+                with tqdm(total=total_rows, desc=desc, unit="row", leave=False) as pbar:
+                    # --- PK Chunking Logic ---
+                    if pk_col_name:
+                        logger.info("Using Primary Key chunking for export of table '%s' on column '%s'.", table_name, pk_col_name)
+                        cursor.execute(f"SELECT MIN(`{pk_col_name}`), MAX(`{pk_col_name}`) FROM `{table_name}`")
+                        min_pk, max_pk = cursor.fetchone()
+
+                        if min_pk is not None and max_pk is not None:
+                            chunk_size = 50000
+                            current_pk = min_pk
                             
-                            rows_in_chunk = 0
+                            with conn.cursor(buffered=False) as unbuffered_cursor:
+                                while current_pk <= max_pk:
+                                    query = f"SELECT * FROM `{table_name}` WHERE `{pk_col_name}` >= {current_pk} AND `{pk_col_name}` < {current_pk + chunk_size}"
+                                    unbuffered_cursor.execute(query)
+                                    
+                                    rows_in_chunk = 0
+                                    while True:
+                                        rows = unbuffered_cursor.fetchmany(10000)
+                                        if not rows:
+                                            break
+                                        writer.writerows(rows)
+                                        rows_in_chunk += len(rows)
+                                    
+                                    exact_row_count += rows_in_chunk
+                                    pbar.update(rows_in_chunk)
+                                    current_pk += chunk_size
+                        else:
+                            logger.info("Table '%s' appears empty despite row count. Exporting headers only.", table_name)
+
+                    # --- Fallback to original streaming method for views or tables without a good PK ---
+                    else:
+                        if is_view:
+                            logger.info("'%s' is a view, using non-chunked streaming export.", table_name)
+                        else:
+                            logger.warning("No suitable single-column integer PK found for '%s'. Using non-chunked streaming. This may fail on large tables.", table_name)
+                        
+                        with conn.cursor(buffered=False) as unbuffered_cursor:
+                            try:
+                                # Set a 2-minute timeout for this operation
+                                unbuffered_cursor.execute("SET SESSION max_execution_time = 120000")
+                                logger.info("Set session max_execution_time to 2 minutes for streaming export.")
+                            except mysql.connector.Error as err:
+                                logger.warning("Could not set max_execution_time: %s. The server's default timeout will be used.", err)
+                            
+                            unbuffered_cursor.execute(f"SELECT * FROM `{table_name}`")
+                            
+                            batch_size = 10000
                             while True:
-                                rows = unbuffered_cursor.fetchmany(10000)
+                                rows = unbuffered_cursor.fetchmany(batch_size)
                                 if not rows:
                                     break
                                 writer.writerows(rows)
-                                rows_in_chunk += len(rows)
-                            
-                            exact_row_count += rows_in_chunk
-                            pbar.update(rows_in_chunk)
-                            current_pk += chunk_size
-                        unbuffered_cursor.close()
-                    else:
-                        logger.info("Table '%s' appears empty despite row count. Exporting headers only.", table_name)
-
-                # --- Fallback to original streaming method for views or tables without a good PK ---
-                else:
-                    if is_view:
-                        logger.info("'%s' is a view, using non-chunked streaming export.", table_name)
-                    else:
-                        logger.warning("No suitable single-column integer PK found for '%s'. Using non-chunked streaming. This may fail on large tables.", table_name)
-                    
-                    unbuffered_cursor = conn.cursor(buffered=False)
-                    try:
-                        # Set a 2-minute timeout for this operation
-                        unbuffered_cursor.execute("SET SESSION max_execution_time = 120000")
-                        logger.info("Set session max_execution_time to 2 minutes for streaming export.")
-                    except mysql.connector.Error as err:
-                        logger.warning("Could not set max_execution_time: %s. The server's default timeout will be used.", err)
-                    
-                    unbuffered_cursor.execute(f"SELECT * FROM `{table_name}`")
-                    
-                    batch_size = 10000
-                    while True:
-                        rows = unbuffered_cursor.fetchmany(batch_size)
-                        if not rows:
-                            break
-                        writer.writerows(rows)
-                        exact_row_count += len(rows)
-                        pbar.update(len(rows))
-                    unbuffered_cursor.close()
+                                exact_row_count += len(rows)
+                                pbar.update(len(rows))
 
         logger.info("Successfully exported %d rows from '%s' to CSV in %s.", exact_row_count, table_name, format_time(time.time() - t_start))
         return True, exact_row_count
@@ -385,14 +378,12 @@ def export_data_to_csv(table_name, csv_file_path):
     except Error as e:
         if e.errno == 2002 and config.DB_HOST.lower() == 'localhost':
             logger.warning("Socket connection failed during CSV export. Falling back to TCP/IP via 127.0.0.1 for '%s'", table_name)
-            config.DB_HOST = '127.0.0.1'
             return export_data_to_csv(table_name, csv_file_path)
             
         logger.error("Error exporting to CSV for table '%s': %s", table_name, e)
         return False, 0
     finally:
-        if 'conn' in locals() and conn.is_connected():
-            cursor.close()
+        if conn:
             conn.close()
 
 def create_destination_db():

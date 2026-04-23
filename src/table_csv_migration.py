@@ -353,14 +353,14 @@ def export_data_to_csv(table_name, csv_file_path):
                         else:
                             logger.warning("No suitable single-column integer PK found for '%s'. Using non-chunked streaming. This may fail on large tables.", table_name)
                         
+                        try:
+                            # Set a 2-minute timeout on the main cursor for this session
+                            cursor.execute("SET SESSION max_execution_time = 120000")
+                            logger.info("Set session max_execution_time to 2 minutes for streaming export.")
+                        except mysql.connector.Error as err:
+                            logger.warning("Could not set max_execution_time: %s. The server's default timeout will be used.", err)
+
                         with conn.cursor(buffered=False) as unbuffered_cursor:
-                            try:
-                                # Set a 2-minute timeout for this operation
-                                unbuffered_cursor.execute("SET SESSION max_execution_time = 120000")
-                                logger.info("Set session max_execution_time to 2 minutes for streaming export.")
-                            except mysql.connector.Error as err:
-                                logger.warning("Could not set max_execution_time: %s. The server's default timeout will be used.", err)
-                            
                             unbuffered_cursor.execute(f"SELECT * FROM `{table_name}`")
                             
                             batch_size = 10000
@@ -376,14 +376,14 @@ def export_data_to_csv(table_name, csv_file_path):
         return True, exact_row_count
 
     except Error as e:
-        if e.errno == 2002 and config.DB_HOST.lower() == 'localhost':
+        if conn and e.errno == 2002 and config.DB_HOST.lower() == 'localhost':
             logger.warning("Socket connection failed during CSV export. Falling back to TCP/IP via 127.0.0.1 for '%s'", table_name)
             return export_data_to_csv(table_name, csv_file_path)
             
         logger.error("Error exporting to CSV for table '%s': %s", table_name, e)
         return False, 0
     finally:
-        if conn:
+        if conn and conn.is_connected():
             conn.close()
 
 def create_destination_db():

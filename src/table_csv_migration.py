@@ -883,6 +883,48 @@ def get_ddl_content(filepath):
             pass
     return ""
 
+def check_and_handle_existing_table(table_name, headless_truncate=False):
+    """Checks if a table exists and asks the user to truncate it or handles it headlessly."""
+    try:
+        conn = get_db_connection(
+            host=config.DEST_DB_HOST, user=config.DEST_DB_USER,
+            password=config.DEST_DB_PASSWORD, database=config.DEST_DB_DATABASE
+        )
+        if not conn.is_connected():
+            return False
+
+        cursor = conn.cursor()
+        cursor.execute(f"SHOW TABLES LIKE '{table_name}'")
+        table_exists = cursor.fetchone() is not None
+
+        if table_exists:
+            if headless_truncate:
+                logger.info("Headless mode: truncating existing table '%s'.", table_name)
+                print(f"Headless mode: truncating existing table '{table_name}'.")
+                cursor.execute(f"TRUNCATE TABLE `{table_name}`")
+                conn.commit()
+                return True
+
+            choice = input(f"Table '{table_name}' already exists. Truncate it? (y/n): ").strip().lower()
+            if choice == 'y':
+                logger.info("User chose to truncate existing table '%s'.", table_name)
+                cursor.execute(f"TRUNCATE TABLE `{table_name}`")
+                conn.commit()
+                return True
+            else:
+                logger.info("User chose not to truncate table '%s'. Cancelling migration for this table.", table_name)
+                print(f"Migration for '{table_name}' cancelled.")
+                return False
+        return True  # Table doesn't exist, proceed
+    except Error as e:
+        logger.error("Error handling existing table '%s': %s", table_name, e)
+        print(f"Error handling existing table '{table_name}'. Check logs.")
+        return False
+    finally:
+        if 'conn' in locals() and conn.is_connected():
+            cursor.close()
+            conn.close()
+
 def write_summary_csv(summary_csv_path, summary_data):
     """Writes summary data to a CSV file, overwriting it."""
     try:
@@ -894,7 +936,7 @@ def write_summary_csv(summary_csv_path, summary_data):
     except Exception as e:
         logger.error("Failed to write summary CSV: %s", e)
 
-def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_multithreading=False):
+def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_multithreading=False, headless_truncate=False):
     """Orchestrates the migration of a single view to a destination table."""
     t_start_total = time.time()
     logger.info("Starting migration from view '%s' to table '%s'", view_name, dest_table_name)
@@ -924,6 +966,11 @@ def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_m
 
         if not is_resuming:
             print(f"\nStarting new migration from view '{view_name}' to table '{dest_table_name}'.")
+
+            if not check_and_handle_existing_table(dest_table_name, headless_truncate):
+                remarks = "Cancelled by user"
+                return
+
             ddl = get_view_ddl(view_name, dest_table_name)
             if not ddl:
                 print(f"Failed to generate DDL for view '{view_name}'. Check logs.")

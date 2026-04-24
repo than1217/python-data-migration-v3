@@ -346,23 +346,26 @@ def export_data_to_csv(table_name, csv_file_path):
                         else:
                             logger.info("Table '%s' appears empty despite row count. Exporting headers only.", table_name)
 
-                    # --- Fallback to pagination (LIMIT/OFFSET) for views or tables without a good PK ---
+                    # --- Fallback to unbuffered streaming for views or tables without a good PK ---
                     else:
                         if is_view:
-                            logger.info("'%s' is a view, using LIMIT/OFFSET pagination export.", table_name)
+                            logger.info("'%s' is a view, using unbuffered streaming export.", table_name)
                         else:
-                            logger.warning("No suitable single-column integer PK found for '%s'. Using LIMIT/OFFSET pagination. This prevents timeouts on large tables.", table_name)
+                            logger.warning("No suitable single-column integer PK found for '%s'. Using unbuffered streaming export.", table_name)
                         
-                        chunk_size = 50000
-                        offset = 0
-                        
-                        while True:
-                            with conn.cursor(buffered=True) as chunk_cursor:
-                                # Execute a fresh query for each chunk to prevent long-running connection drops
-                                query = f"SELECT * FROM `{table_name}` LIMIT {chunk_size} OFFSET {offset}"
-                                chunk_cursor.execute(query)
-                                rows = chunk_cursor.fetchall()
+                        with conn.cursor(buffered=False) as unbuffered_cursor:
+                            try:
+                                # Increase timeouts for long-running streaming queries
+                                unbuffered_cursor.execute("SET SESSION net_read_timeout=7200")
+                                unbuffered_cursor.execute("SET SESSION net_write_timeout=7200")
+                            except Error as e:
+                                logger.warning("Could not set session timeouts: %s", e)
                                 
+                            query = f"SELECT * FROM `{table_name}`"
+                            unbuffered_cursor.execute(query)
+                            
+                            while True:
+                                rows = unbuffered_cursor.fetchmany(10000)
                                 if not rows:
                                     break
                                     
@@ -370,11 +373,6 @@ def export_data_to_csv(table_name, csv_file_path):
                                 rows_fetched = len(rows)
                                 exact_row_count += rows_fetched
                                 pbar.update(rows_fetched)
-                                
-                                if rows_fetched < chunk_size:
-                                    break
-                                    
-                                offset += chunk_size
 
         logger.info("Successfully exported %d rows from '%s' to CSV in %s.", exact_row_count, table_name, format_time(time.time() - t_start))
         return True, exact_row_count

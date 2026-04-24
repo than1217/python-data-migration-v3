@@ -12,7 +12,7 @@ By avoiding massive `.sql` dump files filled with `INSERT` statements, this util
 - **View-to-Table Migration**: Automatically reverse-engineers the schema of a source view, generates a CREATE TABLE statement, and materializes the view as a physical table on the destination server.
 - **Smart Schema Modification**: Automatically extracts source table schemas and updates them for compatibility (InnoDB, utf8mb4) while injecting an optional suffix (e.g., `_v2`, `_v3`) into the target table names.
 - **Interruptible & Resumable**: Automatically logs progress to `csv_migration_state.json`. If a network error or crash occurs mid-migration, simply run the script again to resume precisely where it left off, down to the exact byte in the CSV file.
-- **Detailed Summary Reports**: At the end of a run, a `.csv` report is generated in the `output/` directory, detailing table names, execution times, DDL statements used, row counts, and any errors encountered.
+- **Detailed Summary Reports**: At the end of a run, a `.csv` report is generated (and seamlessly appended to across multiple runs) in the `output/` directory, detailing table names, execution times, DDL statements used, row counts, and any errors encountered.
 - **Automatic Fallbacks**: Gracefully switches from UNIX Socket to TCP/IP connections if needed, ensuring local migrations are as frictionless as possible.
 
 ## Project Structure

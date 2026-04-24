@@ -972,13 +972,15 @@ def check_and_handle_existing_table(table_name, headless_truncate=False):
             conn.close()
 
 def write_summary_csv(summary_csv_path, summary_data):
-    """Writes summary data to a CSV file, overwriting it."""
+    """Writes summary data to a CSV file, appending if it exists."""
     try:
-        with open(summary_csv_path, 'w', encoding='utf-8', newline='') as f:
+        file_exists = os.path.exists(summary_csv_path)
+        with open(summary_csv_path, 'a', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['table_name', 'total_migration', 'ddl_sql', 'total_rows', 'remarks'])
+            if not file_exists:
+                writer.writerow(['table_name', 'total_migration', 'ddl_sql', 'total_rows', 'remarks'])
             writer.writerows(summary_data)
-        logger.info("Summary CSV successfully generated at '%s'", summary_csv_path)
+        logger.info("Summary CSV successfully updated at '%s'", summary_csv_path)
     except Exception as e:
         logger.error("Failed to write summary CSV: %s", e)
 
@@ -1066,14 +1068,15 @@ def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_m
         print(f"Loading data into table '{dest_table_name}'...")
         if load_csv_to_dest(dest_table_name, csv_file, state, use_multithreading):
             elapsed_str = format_time(time.time() - t_start_total)
-            print(f"Successfully migrated view '{view_name}' to table '{dest_table_name}' in {elapsed_str}.")
-            logger.info("View to table migration for '%s' completed in %s.", dest_table_name, elapsed_str)
+            final_row_count = state.get("csv_load_progress", {}).get(dest_table_name, {}).get("rows_loaded", 0)
+            
+            print(f"Successfully migrated view '{view_name}' to table '{dest_table_name}' in {elapsed_str} ({final_row_count} rows).")
+            logger.info("View to table migration for '%s' completed in %s (%d rows).", dest_table_name, elapsed_str, final_row_count)
             
             if "migrated_tables" not in state:
                 state["migrated_tables"] = []
             state["migrated_tables"].append(dest_table_name)
             
-            final_row_count = state.get("csv_load_progress", {}).get(dest_table_name, {}).get("rows_loaded", 0)
             state.setdefault("final_row_counts", {})[dest_table_name] = final_row_count
             
             if dest_table_name in state.get("csv_load_progress", {}):
@@ -1167,13 +1170,13 @@ def run_migration(tables, state, suffix, use_multithreading=False, headless_skip
                 # Skip schema drop/create, go straight to appending CSV data
                 if load_csv_to_dest(target_table_name, csv_file, state, use_multithreading):
                     elapsed = format_time(time.time() - t_start)
-                    logger.info("Total migration for table '%s' completed in %s.", table, elapsed)
+                    final_row_count = state.get("csv_load_progress", {}).get(target_table_name, {}).get("rows_loaded", 0)
+                    logger.info("Total migration for table '%s' completed in %s (%d rows).", table, elapsed, final_row_count)
                     successful_migrations += 1
                     if "migrated_tables" not in state:
                         state["migrated_tables"] = []
                     state["migrated_tables"].append(table)
                     
-                    final_row_count = state.get("csv_load_progress", {}).get(target_table_name, {}).get("rows_loaded", 0)
                     state.setdefault("final_row_counts", {})[target_table_name] = final_row_count
                     
                     if target_table_name in state.get("csv_load_progress", {}):
@@ -1222,13 +1225,13 @@ def run_migration(tables, state, suffix, use_multithreading=False, headless_skip
                             # 5. Load CSV to destination DB
                             if load_csv_to_dest(target_table_name, csv_file, state, use_multithreading):
                                 elapsed = format_time(time.time() - t_start)
-                                logger.info("Total migration for table '%s' completed in %s.", table, elapsed)
+                                final_row_count = state.get("csv_load_progress", {}).get(target_table_name, {}).get("rows_loaded", 0)
+                                logger.info("Total migration for table '%s' completed in %s (%d rows).", table, elapsed, final_row_count)
                                 successful_migrations += 1
                                 if "migrated_tables" not in state:
                                     state["migrated_tables"] = []
                                 state["migrated_tables"].append(table)
                                 
-                                final_row_count = state.get("csv_load_progress", {}).get(target_table_name, {}).get("rows_loaded", 0)
                                 state.setdefault("final_row_counts", {})[target_table_name] = final_row_count
                                 
                                 if target_table_name in state.get("csv_load_progress", {}):
@@ -1259,6 +1262,9 @@ def run_migration(tables, state, suffix, use_multithreading=False, headless_skip
             
         summary_data.append([target_table_name, elapsed, ddl_content, total_rows_migrated, remarks])
             
+    # Calculate total rows from summary_data
+    total_rows_all_tables = sum(row[3] for row in summary_data if isinstance(row[3], int))
+    
     summary = f"Migration complete: {successful_migrations}/{len(tables)} tables migrated."
     print(f"\n{summary}")
     logger.info(summary)
@@ -1273,8 +1279,9 @@ def run_migration(tables, state, suffix, use_multithreading=False, headless_skip
     elapsed_time = time.time() - start_time
     m, s = divmod(elapsed_time, 60)
     h, m = divmod(m, 60)
-    print(f"Total migration time: {int(h):02d}:{int(m):02d}:{int(s):02d}")
-    logger.info("--- MIGRATION FINISHED ---")
+    time_str = f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+    print(f"Total migration time: {time_str} | Total rows migrated: {total_rows_all_tables}")
+    logger.info("--- MIGRATION FINISHED --- Total Time: %s | Total Rows: %d", time_str, total_rows_all_tables)
 
 # The menu system mimics the original tool for ease of use
 def choose_database():

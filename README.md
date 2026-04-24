@@ -6,7 +6,10 @@ By avoiding massive `.sql` dump files filled with `INSERT` statements, this util
 
 ## Key Features
 - **Low Memory Footprint**: Uses Python's native `mysql.connector` with unbuffered cursors to stream source data directly into chunked `.csv` files.
+- **Optimized Unbuffered Streaming**: Employs server-side cursors (SSCursor) to stream massive tables and views (e.g., 30M+ rows) in linear time ($O(N)$), preventing timeouts and avoiding the exponential slowdown of `LIMIT/OFFSET` pagination.
 - **High-Speed Ingestion**: Leverages MySQL's native `LOAD DATA INFILE` for bulk data loading, falling back to `LOAD DATA LOCAL INFILE` or standard batch `INSERT` logic if server restrictions apply.
+- **Multithreaded Data Loading**: Drastically accelerates data insertion by splitting large CSVs into chunks and loading them into the destination database concurrently.
+- **View-to-Table Migration**: Automatically reverse-engineers the schema of a source view, generates a CREATE TABLE statement, and materializes the view as a physical table on the destination server.
 - **Smart Schema Modification**: Automatically extracts source table schemas and updates them for compatibility (InnoDB, utf8mb4) while injecting an optional suffix (e.g., `_v2`, `_v3`) into the target table names.
 - **Interruptible & Resumable**: Automatically logs progress to `csv_migration_state.json`. If a network error or crash occurs mid-migration, simply run the script again to resume precisely where it left off, down to the exact byte in the CSV file.
 - **Detailed Summary Reports**: At the end of a run, a `.csv` report is generated in the `output/` directory, detailing table names, execution times, DDL statements used, row counts, and any errors encountered.
@@ -43,7 +46,7 @@ Run the interactive console application:
 ```bash
 python src/table_csv_migration.py
 ```
-A menu-driven wizard will guide you through connecting to source and destination databases, supplying a table suffix (e.g., `_v3`), and selecting table patterns (Regex) or exact lists to migrate.
+A menu-driven wizard will guide you through connecting to source and destination databases, supplying a table suffix (e.g., `_v3`), and selecting table patterns (Regex), exact lists to migrate, or migrating specific views to physical tables.
 
 ### Headless Mode (Automated)
 You can automate migrations by passing a JSON configuration file via the `--headless` flag. This bypasses all interactive prompts and uses passwords securely read from your `.env` file.
@@ -63,6 +66,8 @@ python src/table_csv_migration.py --headless config.json
   "dest_db_database": "dest_db_name",
   "dest_db_user": "dest_user",
   "pattern": "^lib_.*",
+  "multithreaded": true,
+  "skip_extract": false,
   "force_restart": false
 }
 ```

@@ -929,43 +929,70 @@ def get_ddl_content(filepath):
             pass
     return ""
 
-def check_and_handle_existing_table(table_name, headless_truncate=False):
-    """Checks if a table exists and asks the user to truncate it or handles it headlessly."""
+def check_and_handle_existing_table(table_name, headless_action=None, global_action=None):
+    """Checks if a table exists and asks the user to drop, truncate or skip it.
+    Returns: (proceed: bool, action: str ('drop' or 'truncate'), new_global_action: str)
+    """
     try:
         conn = get_db_connection(
             host=config.DEST_DB_HOST, user=config.DEST_DB_USER,
             password=config.DEST_DB_PASSWORD, database=config.DEST_DB_DATABASE
         )
         if not conn.is_connected():
-            return False
+            return False, None, global_action
 
         cursor = conn.cursor()
         cursor.execute(f"SHOW TABLES LIKE '{table_name}'")
         table_exists = cursor.fetchone() is not None
 
         if table_exists:
-            if headless_truncate:
-                logger.info("Headless mode: truncating existing table '%s'.", table_name)
-                print(f"Headless mode: truncating existing table '{table_name}'.")
-                cursor.execute(f"TRUNCATE TABLE `{table_name}`")
-                conn.commit()
-                return True
+            if headless_action in ['drop', 'truncate', 'skip']:
+                action = headless_action
+                if action == 'skip':
+                    logger.info("Headless mode: skipping existing table '%s'.", table_name)
+                    print(f"Headless mode: skipping existing table '{table_name}'.")
+                    return False, None, global_action
+            elif global_action in ['drop', 'truncate', 'skip']:
+                action = global_action
+                if action == 'skip':
+                    return False, None, global_action
+            else:
+                choice = input(f"Table '{table_name}' already exists. Drop(d), Truncate(t), Skip(s), All-Drop(ad), All-Truncate(at), All-Skip(as)? (d/t/s/ad/at/as): ").strip().lower()
+                if choice == 'ad':
+                    global_action = 'drop'
+                    action = 'drop'
+                elif choice == 'at':
+                    global_action = 'truncate'
+                    action = 'truncate'
+                elif choice == 'as':
+                    global_action = 'skip'
+                    logger.info("User chose to skip table '%s'.", table_name)
+                    return False, None, global_action
+                elif choice == 'd':
+                    action = 'drop'
+                elif choice == 't':
+                    action = 'truncate'
+                else:
+                    logger.info("User chose to skip table '%s'. Cancelling migration for this table.", table_name)
+                    print(f"Migration for '{table_name}' skipped.")
+                    return False, None, global_action
 
-            choice = input(f"Table '{table_name}' already exists. Truncate it? (y/n): ").strip().lower()
-            if choice == 'y':
+            if action == 'drop':
+                logger.info("User chose to drop existing table '%s'.", table_name)
+                cursor.execute(f"DROP TABLE `{table_name}`")
+                conn.commit()
+                return True, 'drop', global_action
+            elif action == 'truncate':
                 logger.info("User chose to truncate existing table '%s'.", table_name)
                 cursor.execute(f"TRUNCATE TABLE `{table_name}`")
                 conn.commit()
-                return True
-            else:
-                logger.info("User chose not to truncate table '%s'. Cancelling migration for this table.", table_name)
-                print(f"Migration for '{table_name}' cancelled.")
-                return False
-        return True  # Table doesn't exist, proceed
+                return True, 'truncate', global_action
+
+        return True, 'drop', global_action  # Table doesn't exist, proceed
     except Error as e:
         logger.error("Error handling existing table '%s': %s", table_name, e)
         print(f"Error handling existing table '{table_name}'. Check logs.")
-        return False
+        return False, None, global_action
     finally:
         if 'conn' in locals() and conn.is_connected():
             cursor.close()
@@ -984,7 +1011,7 @@ def write_summary_csv(summary_csv_path, summary_data):
     except Exception as e:
         logger.error("Failed to write summary CSV: %s", e)
 
-def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_multithreading=False, headless_truncate=False):
+def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_multithreading=False, headless_action=None):
     """Orchestrates the migration of a single view to a destination table."""
     t_start_total = time.time()
     logger.info("Starting migration from view '%s' to table '%s'", view_name, dest_table_name)
@@ -1015,25 +1042,31 @@ def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_m
         if not is_resuming:
             print(f"\nStarting new migration from view '{view_name}' to table '{dest_table_name}'.")
 
-            if not check_and_handle_existing_table(dest_table_name, headless_truncate):
+            proceed, action, _ = check_and_handle_existing_table(dest_table_name, headless_action=headless_action)
+            if not proceed:
                 remarks = "Cancelled by user"
                 return
 
-            ddl = get_view_ddl(view_name, dest_table_name)
-            if not ddl:
-                print(f"Failed to generate DDL for view '{view_name}'. Check logs.")
-                remarks = "Failed: DDL Generation"
-                return
-
-            try:
+            if action == 'truncate':
+                logger.info("Table '%s' was truncated. Skipping DDL extraction and creation.", dest_table_name)
                 with open(processed_schema, 'w', encoding='utf-8') as f:
-                    f.write(ddl)
-                logger.info("Successfully generated DDL for view '%s'.", view_name)
-            except IOError as e:
-                logger.error("Failed to write schema file %s: %s", processed_schema, e)
-                print(f"Error writing schema file. Check logs.")
-                remarks = "Failed: Write DDL to file"
-                return
+                    f.write("-- Schema extraction skipped due to truncate action.\n")
+            else:
+                ddl = get_view_ddl(view_name, dest_table_name)
+                if not ddl:
+                    print(f"Failed to generate DDL for view '{view_name}'. Check logs.")
+                    remarks = "Failed: DDL Generation"
+                    return
+
+                try:
+                    with open(processed_schema, 'w', encoding='utf-8') as f:
+                        f.write(ddl)
+                    logger.info("Successfully generated DDL for view '%s'.", view_name)
+                except IOError as e:
+                    logger.error("Failed to write schema file %s: %s", processed_schema, e)
+                    print(f"Error writing schema file. Check logs.")
+                    remarks = "Failed: Write DDL to file"
+                    return
 
             use_existing_csv = False
             if os.path.exists(csv_file):
@@ -1057,11 +1090,12 @@ def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_m
                 remarks = "Failed: Export data to CSV"
                 return
 
-            print(f"Creating table '{dest_table_name}' on destination...")
-            if not load_sql_schema(processed_schema):
-                print(f"Failed to create table '{dest_table_name}'. Check logs.")
-                remarks = "Failed: Execute schema in destination"
-                return
+            if action != 'truncate':
+                print(f"Creating table '{dest_table_name}' on destination...")
+                if not load_sql_schema(processed_schema):
+                    print(f"Failed to create table '{dest_table_name}'. Check logs.")
+                    remarks = "Failed: Execute schema in destination"
+                    return
         else:
             print(f"\nResuming migration for table '{dest_table_name}'.")
 
@@ -1098,7 +1132,7 @@ def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_m
         write_summary_csv(summary_csv_path, summary_data)
         logger.info("View migration summary for '%s' generated with status: %s", dest_table_name, remarks)
 
-def run_migration(tables, state, suffix, use_multithreading=False, headless_skip_extract=None):
+def run_migration(tables, state, suffix, use_multithreading=False, headless_skip_extract=None, headless_action=None):
     folder_name = suffix.strip('_') if suffix else 'v2'
 
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1127,6 +1161,7 @@ def run_migration(tables, state, suffix, use_multithreading=False, headless_skip
 
     successful_migrations = sum(1 for t in tables if t in state.get("migrated_tables", []))
     global_skip_extract = headless_skip_extract
+    global_existing_action = None
 
     pbar_main = tqdm(tables, desc="Migrating Tables (CSV)", unit="table", leave=True)
     for table in pbar_main:
@@ -1189,69 +1224,88 @@ def run_migration(tables, state, suffix, use_multithreading=False, headless_skip
                 remarks = "Failed: Export data to CSV (Resume)"
                 logger.warning("Failed to export CSV for table '%s'.", table)
         else:
-            # 1. Dump raw schema
-            if run_mysqldump_schema(table, raw_schema):
-                # 2. Process schema (and delete raw)
-                if process_schema_file(raw_schema, processed_schema, table, suffix):
-                    # 3. Export data as CSV or use existing
-                    use_existing = False
-                    if os.path.exists(csv_file):
-                        if global_skip_extract is not None:
-                            choice = global_skip_extract
-                        else:
-                            choice = input(f"\nExisting CSV file found for '{table}'. Skip extraction and use existing? (y/n/all-y/all-n): ").strip().lower()
-                            if choice == 'all-y':
-                                global_skip_extract = 'y'
-                                choice = 'y'
-                            elif choice == 'all-n':
-                                global_skip_extract = 'n'
-                                choice = 'n'
-                                
-                        if choice == 'y':
-                            logger.info("User chose to use existing CSV for '%s'. Skipping extraction.", table)
-                            use_existing = True
-                        else:
-                            logger.info("User chose to re-extract CSV for '%s'.", table)
-                        
-                    export_success = False
-                    if use_existing:
-                        export_success = True
-                    else:
-                        export_success, exact_count = export_data_to_csv(table, csv_file)
-                        
-                    if export_success:
-                        # 4. Load Schema to destination DB
-                        if load_sql_schema(processed_schema):
-                            # 5. Load CSV to destination DB
-                            if load_csv_to_dest(target_table_name, csv_file, state, use_multithreading):
-                                elapsed = format_time(time.time() - t_start)
-                                final_row_count = state.get("csv_load_progress", {}).get(target_table_name, {}).get("rows_loaded", 0)
-                                logger.info("Total migration for table '%s' completed in %s (%d rows).", table, elapsed, final_row_count)
-                                successful_migrations += 1
-                                if "migrated_tables" not in state:
-                                    state["migrated_tables"] = []
-                                state["migrated_tables"].append(table)
-                                
-                                state.setdefault("final_row_counts", {})[target_table_name] = final_row_count
-                                
-                                if target_table_name in state.get("csv_load_progress", {}):
-                                    del state["csv_load_progress"][target_table_name]
-                                save_state(state)
-                            else:
-                                remarks = "Failed: Load CSV to destination"
-                                logger.warning("Failed to load CSV to destination for table '%s'.", table)
-                        else:
-                            remarks = "Failed: Execute schema in destination"
-                            logger.warning("Failed to execute schema in destination for table '%s'.", table)
-                    else:
-                        remarks = "Failed: Export data to CSV"
-                        logger.warning("Failed to export CSV for table '%s'.", table)
-                else:
-                    remarks = "Failed: Process schema file"
-                    logger.warning("Failed to process schema for table '%s'.", table)
+            proceed, action, global_existing_action = check_and_handle_existing_table(target_table_name, headless_action=headless_action, global_action=global_existing_action)
+            if not proceed:
+                remarks = "Skipped by user"
+                summary_data.append([target_table_name, "Skipped", "", 0, remarks])
+                continue
+
+            schema_success = True
+            if action == 'truncate':
+                logger.info("Table '%s' was truncated. Skipping schema extraction and creation.", target_table_name)
+                with open(processed_schema, 'w', encoding='utf-8') as f:
+                    f.write("-- Schema extraction skipped due to truncate action.\n")
             else:
-                remarks = "Failed: Dump schema"
-                logger.warning("Failed to dump schema for table '%s'.", table)
+                # 1. Dump raw schema
+                if run_mysqldump_schema(table, raw_schema):
+                    # 2. Process schema (and delete raw)
+                    if not process_schema_file(raw_schema, processed_schema, table, suffix):
+                        schema_success = False
+                        remarks = "Failed: Process schema file"
+                        logger.warning("Failed to process schema for table '%s'.", table)
+                else:
+                    schema_success = False
+                    remarks = "Failed: Dump schema"
+                    logger.warning("Failed to dump schema for table '%s'.", table)
+
+            if schema_success:
+                # 3. Export data as CSV or use existing
+                use_existing = False
+                if os.path.exists(csv_file):
+                    if global_skip_extract is not None:
+                        choice = global_skip_extract
+                    else:
+                        choice = input(f"\nExisting CSV file found for '{table}'. Skip extraction and use existing? (y/n/all-y/all-n): ").strip().lower()
+                        if choice == 'all-y':
+                            global_skip_extract = 'y'
+                            choice = 'y'
+                        elif choice == 'all-n':
+                            global_skip_extract = 'n'
+                            choice = 'n'
+                            
+                    if choice == 'y':
+                        logger.info("User chose to use existing CSV for '%s'. Skipping extraction.", table)
+                        use_existing = True
+                    else:
+                        logger.info("User chose to re-extract CSV for '%s'.", table)
+                    
+                export_success = False
+                if use_existing:
+                    export_success = True
+                else:
+                    export_success, exact_count = export_data_to_csv(table, csv_file)
+                    
+                if export_success:
+                    # 4. Load Schema to destination DB
+                    load_schema_success = True
+                    if action != 'truncate':
+                        load_schema_success = load_sql_schema(processed_schema)
+                    
+                    if load_schema_success:
+                        # 5. Load CSV to destination DB
+                        if load_csv_to_dest(target_table_name, csv_file, state, use_multithreading):
+                            elapsed = format_time(time.time() - t_start)
+                            final_row_count = state.get("csv_load_progress", {}).get(target_table_name, {}).get("rows_loaded", 0)
+                            logger.info("Total migration for table '%s' completed in %s (%d rows).", table, elapsed, final_row_count)
+                            successful_migrations += 1
+                            if "migrated_tables" not in state:
+                                state["migrated_tables"] = []
+                            state["migrated_tables"].append(table)
+                            
+                            state.setdefault("final_row_counts", {})[target_table_name] = final_row_count
+                            
+                            if target_table_name in state.get("csv_load_progress", {}):
+                                del state["csv_load_progress"][target_table_name]
+                            save_state(state)
+                        else:
+                            remarks = "Failed: Load CSV to destination"
+                            logger.warning("Failed to load CSV to destination for table '%s'.", table)
+                    else:
+                        remarks = "Failed: Execute schema in destination"
+                        logger.warning("Failed to execute schema in destination for table '%s'.", table)
+                else:
+                    remarks = "Failed: Export data to CSV"
+                    logger.warning("Failed to export CSV for table '%s'.", table)
             
         elapsed = format_time(time.time() - t_start)
         ddl_content = get_ddl_content(processed_schema)
@@ -1509,7 +1563,11 @@ def main():
         elif skip_extract_cfg is False:
             headless_skip = 'n'
             
-        run_migration(tables, state, suffix, use_multithreading=use_mt, headless_skip_extract=headless_skip)
+        headless_action = headless_config.get('existing_table_action', None)
+        if headless_action not in ['drop', 'truncate', 'skip']:
+            headless_action = None
+            
+        run_migration(tables, state, suffix, use_multithreading=use_mt, headless_skip_extract=headless_skip, headless_action=headless_action)
         sys.exit(0)
 
     while True:

@@ -9,6 +9,7 @@ import getpass
 import argparse
 import csv
 import threading
+import queue
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import mysql.connector
@@ -148,7 +149,7 @@ def run_mysqldump_schema(table, output_file):
             with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as err_file:
                 process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=err_file, text=False)
                 
-                with open(output_file, "wb") as f, tqdm(desc=f"Dumping Schema {table}", unit="B", unit_scale=True, leave=False) as pbar:
+                with open(output_file, "wb") as f, tqdm(desc=f"Dumping Schema {table}", unit="B", unit_scale=True, leave=False, position=1) as pbar:
                     if process.stdout is not None:
                         while True:
                             chunk = process.stdout.read(1024 * 1024)
@@ -194,7 +195,7 @@ def run_mysqldump_full(table, output_file):
             with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as err_file:
                 process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=err_file, text=False)
                 
-                with open(output_file, "wb") as f, tqdm(desc=f"Dumping SQL {table}", unit="B", unit_scale=True, leave=False) as pbar:
+                with open(output_file, "wb") as f, tqdm(desc=f"Dumping SQL {table}", unit="B", unit_scale=True, leave=False, position=1) as pbar:
                     if process.stdout is not None:
                         while True:
                             chunk = process.stdout.read(1024 * 1024)
@@ -360,7 +361,7 @@ def export_data_to_csv(table_name, csv_file_path):
                         pk_col_name = pk_cols[0][0]
                 
                 exact_row_count = 0
-                with tqdm(total=total_rows, desc=desc, unit="row", leave=False) as pbar:
+                with tqdm(total=total_rows, desc=desc, unit="row", leave=False, position=1) as pbar:
                     # --- PK Chunking Logic ---
                     if pk_col_name:
                         logger.info("Using Primary Key chunking for export of table '%s' on column '%s'.", table_name, pk_col_name)
@@ -482,7 +483,7 @@ def load_sql_schema(filepath):
             try:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err_file, text=False)
                 file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-                with open(filepath, 'rb') as f, tqdm(total=file_size, desc=f"Executing {filename}", unit="B", unit_scale=True, leave=False) as pbar:
+                with open(filepath, 'rb') as f, tqdm(total=file_size, desc=f"Executing {filename}", unit="B", unit_scale=True, leave=False, position=1) as pbar:
                     while True:
                         chunk = f.read(1024 * 1024) # Read in 1MB chunks
                         if not chunk:
@@ -695,14 +696,22 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
 
     if use_multithreading:
         logger.info("Loading CSV into destination table '%s' using MULTI-THREADED chunks (Remote dest: %s)...", target_table_name, is_remote_dest)
-        chunk_size = 250000
+        chunk_size = 100000
         temp_dir = tempfile.gettempdir()
         
         completed_chunks_set = set(completed_chunks)
         
+        position_queue = queue.Queue()
+        for i in range(2, 6):
+            position_queue.put(i)
+        
         def process_wrapper(t_csv, h_list, b_processed, c_id):
             """Wrapper to call the shared chunk processor and return values needed for futures."""
-            success, rows_count = _process_csv_chunk(target_table_name, t_csv, h_list, is_remote_dest)
+            pos = position_queue.get()
+            with tqdm(total=b_processed, desc=f"Chunk {c_id}", position=pos, unit="B", unit_scale=True, leave=False) as pbar_chunk:
+                success, rows_count = _process_csv_chunk(target_table_name, t_csv, h_list, is_remote_dest)
+                pbar_chunk.update(b_processed)
+            position_queue.put(pos)
             return success, rows_count, b_processed, c_id
 
         futures = []
@@ -724,38 +733,51 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             if last_byte_pos > 0 and not completed_chunks_set:
                 f.seek(last_byte_pos)
                 bytes_skipped = last_byte_pos
-            
-            while True:
-                chunk_rows = []
-                bytes_processed = 0
-                is_completed = chunk_id in completed_chunks_set
                 
-                for _ in range(chunk_size):
-                    line = f.readline()
-                    if not line: break
-                    if not is_completed:
-                        chunk_rows.append(line)
-                    bytes_processed += len(line.encode('utf-8'))
+            print(f"Splitting CSV and preparing chunks for {target_table_name}...")
+            # We don't need to track bytes_processed per chunk inside the generator anymore
+            # we will just use the file sizes of the generated chunks to update the progress bar.
+            
+            with tqdm(total=file_size, initial=bytes_skipped, desc=f"Preparing Chunks", unit="B", unit_scale=True, leave=False, position=1) as pbar_split:
+                while True:
+                    chunk_rows = []
+                    is_completed = chunk_id in completed_chunks_set
                     
-                if bytes_processed == 0:
-                    break
+                    bytes_in_chunk = 0
+                    for _ in range(chunk_size):
+                        line = f.readline()
+                        if not line: break
+                        if not is_completed:
+                            chunk_rows.append(line)
+                        bytes_in_chunk += len(line.encode('utf-8'))
                     
-                if is_completed:
-                    bytes_skipped += bytes_processed
-                else:
-                    temp_csv = os.path.join(temp_dir, f"{target_table_name}_chunk_{uuid.uuid4().hex}.tmp")
-                    with open(temp_csv, 'w', encoding='utf-8', newline='') as tf:
-                        tf.write(header_line)
-                        tf.writelines(chunk_rows)
-                    futures.append(executor.submit(process_wrapper, temp_csv, headers, bytes_processed, chunk_id))
-                    
-                chunk_id += 1
+                    if bytes_in_chunk == 0 and not chunk_rows:
+                        break
+                        
+                    if is_completed:
+                        bytes_skipped += bytes_in_chunk
+                    else:
+                        temp_csv = os.path.join(temp_dir, f"{target_table_name}_chunk_{uuid.uuid4().hex}.tmp")
+                        with open(temp_csv, 'w', encoding='utf-8', newline='') as tf:
+                            tf.write(header_line)
+                            tf.writelines(chunk_rows)
+                        
+                        # Use actual file size of the chunk for accurate tracking
+                        actual_chunk_size = os.path.getsize(temp_csv)
+                        futures.append(executor.submit(process_wrapper, temp_csv, headers, actual_chunk_size, chunk_id))
+                        
+                    chunk_id += 1
+                    pbar_split.update(bytes_in_chunk)
                 
         total_loaded = rows_loaded
         state_lock = threading.Lock()
         
         multithread_failed = False
-        with tqdm(total=file_size, initial=bytes_skipped, desc=f"MT Loading {target_table_name}", unit="B", unit_scale=True, leave=False) as pbar:
+        
+        # Calculate total target bytes to load (sum of all pending chunk sizes)
+        total_bytes_to_load = sum(f.result()[2] if not f.done() else f.result()[2] for f in futures) if futures else file_size
+        
+        with tqdm(total=total_bytes_to_load, desc=f"MT Loading {target_table_name}", unit="B", unit_scale=True, leave=False, position=1) as pbar:
             for future in as_completed(futures):
                 success, loaded_count, b_processed, c_id = future.result()
                 if not success:
@@ -768,7 +790,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                     total_loaded += loaded_count
                     completed_chunks_set.add(c_id)
                     state["csv_load_progress"][target_table_name] = {
-                        "last_byte_pos": bytes_skipped,
+                        "last_byte_pos": bytes_skipped, # Maintain skipped offset for resume compatibility
                         "rows_loaded": total_loaded,
                         "completed_chunks": list(completed_chunks_set)
                     }
@@ -867,7 +889,8 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
         else:
             f.seek(last_byte_pos)
             
-        with tqdm(total=file_size, initial=last_byte_pos, desc=f"Loading CSV {target_table_name}", unit="B", unit_scale=True, leave=False) as pbar:
+        with tqdm(total=file_size, initial=last_byte_pos, desc=f"Loading CSV {target_table_name}", unit="B", unit_scale=True, leave=False, position=1) as pbar:
+            chunk_idx = 0
             while True:
                 chunk_rows = []
                 for _ in range(chunk_size):
@@ -887,7 +910,9 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                 current_byte_pos = f.tell()
                 bytes_processed = current_byte_pos - last_byte_pos
                 
-                success, loaded_count = _process_csv_chunk(target_table_name, temp_csv, headers, is_remote_dest)
+                with tqdm(total=bytes_processed, desc=f"Chunk {chunk_idx}", position=2, unit="B", unit_scale=True, leave=False) as pbar_chunk:
+                    success, loaded_count = _process_csv_chunk(target_table_name, temp_csv, headers, is_remote_dest)
+                    pbar_chunk.update(bytes_processed)
                     
                 if not success:
                     logger.error("Failed to load chunk for table '%s'.", target_table_name)
@@ -903,6 +928,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                 save_state(state)
                 
                 pbar.update(bytes_processed)
+                chunk_idx += 1
 
     logger.info("Successfully loaded CSV into '%s' in %s.", target_table_name, format_time(time.time() - t_start))
     return True
@@ -1227,7 +1253,7 @@ def run_migration(tables, state, suffix, use_multithreading=False, headless_skip
     global_skip_extract = headless_skip_extract
     global_existing_action = None
 
-    pbar_main = tqdm(tables, desc="Migrating Tables (CSV)", unit="table", leave=True)
+    pbar_main = tqdm(tables, desc="Migrating Tables (CSV)", unit="table", leave=True, position=0)
     for table in pbar_main:
         pbar_main.set_postfix(table=table)
         pbar_main.refresh()
@@ -1505,7 +1531,7 @@ def run_export_only(tables, suffix, export_format='csv'):
     logger.info("Starting export of %d tables to %s format in %s", len(tables), export_format.upper(), export_dir)
     print(f"\nExporting {len(tables)} tables to {export_format.upper()} in '{export_dir}'...")
     
-    for table in tqdm(tables, desc="Exporting Tables", unit="table"):
+    for table in tqdm(tables, desc="Exporting Tables", unit="table", position=0):
         target_table_name = table if table.endswith(suffix) else f"{table}{suffix}"
         
         if export_format == 'sql':

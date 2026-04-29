@@ -696,7 +696,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
 
     if use_multithreading:
         logger.info("Loading CSV into destination table '%s' using MULTI-THREADED chunks (Remote dest: %s)...", target_table_name, is_remote_dest)
-        chunk_size = 100000
+        chunk_size = 250000
         temp_dir = tempfile.gettempdir()
         
         completed_chunks_set = set(completed_chunks)
@@ -728,34 +728,37 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             headers = next(csv.reader([header_line]))
             
             chunk_id = 0
+            
+            header_line_bytes = len(header_line.encode('utf-8'))
             bytes_skipped = 0
             
             if last_byte_pos > 0 and not completed_chunks_set:
                 f.seek(last_byte_pos)
                 bytes_skipped = last_byte_pos
+            elif not completed_chunks_set:
+                bytes_skipped = header_line_bytes
                 
             print(f"Splitting CSV and preparing chunks for {target_table_name}...")
-            # We don't need to track bytes_processed per chunk inside the generator anymore
-            # we will just use the file sizes of the generated chunks to update the progress bar.
+            # Use the actual file sizes of the generated chunks to update the progress bar to avoid CPU overhead
             
             with tqdm(total=file_size, initial=bytes_skipped, desc=f"Preparing Chunks", unit="B", unit_scale=True, leave=False, position=1) as pbar_split:
                 while True:
                     chunk_rows = []
                     is_completed = chunk_id in completed_chunks_set
                     
-                    bytes_in_chunk = 0
                     for _ in range(chunk_size):
                         line = f.readline()
                         if not line: break
-                        if not is_completed:
-                            chunk_rows.append(line)
-                        bytes_in_chunk += len(line.encode('utf-8'))
-                    
-                    if bytes_in_chunk == 0 and not chunk_rows:
+                        chunk_rows.append(line)
+                        
+                    if not chunk_rows:
                         break
                         
                     if is_completed:
+                        # Fast approximation for skipped chunks
+                        bytes_in_chunk = sum(len(line) for line in chunk_rows)
                         bytes_skipped += bytes_in_chunk
+                        pbar_split.update(bytes_in_chunk)
                     else:
                         temp_csv = os.path.join(temp_dir, f"{target_table_name}_chunk_{uuid.uuid4().hex}.tmp")
                         with open(temp_csv, 'w', encoding='utf-8', newline='') as tf:
@@ -764,10 +767,11 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                         
                         # Use actual file size of the chunk for accurate tracking
                         actual_chunk_size = os.path.getsize(temp_csv)
+                        bytes_for_pbar = max(0, actual_chunk_size - header_line_bytes)
                         futures.append(executor.submit(process_wrapper, temp_csv, headers, actual_chunk_size, chunk_id))
+                        pbar_split.update(bytes_for_pbar)
                         
                     chunk_id += 1
-                    pbar_split.update(bytes_in_chunk)
                 
         total_loaded = rows_loaded
         state_lock = threading.Lock()
@@ -883,9 +887,10 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             return True
             
         headers = next(csv.reader([header_line]))
+        header_line_bytes = len(header_line.encode('utf-8'))
         
         if last_byte_pos == 0:
-            last_byte_pos = f.tell()
+            last_byte_pos = header_line_bytes
         else:
             f.seek(last_byte_pos)
             
@@ -907,19 +912,19 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                     tf.write(header_line)
                     tf.writelines(chunk_rows)
                     
-                current_byte_pos = f.tell()
-                bytes_processed = current_byte_pos - last_byte_pos
+                actual_chunk_size = os.path.getsize(temp_csv)
+                bytes_processed = max(0, actual_chunk_size - header_line_bytes)
                 
-                with tqdm(total=bytes_processed, desc=f"Chunk {chunk_idx}", position=2, unit="B", unit_scale=True, leave=False) as pbar_chunk:
+                with tqdm(total=actual_chunk_size, desc=f"Chunk {chunk_idx}", position=2, unit="B", unit_scale=True, leave=False) as pbar_chunk:
                     success, loaded_count = _process_csv_chunk(target_table_name, temp_csv, headers, is_remote_dest)
-                    pbar_chunk.update(bytes_processed)
+                    pbar_chunk.update(actual_chunk_size)
                     
                 if not success:
                     logger.error("Failed to load chunk for table '%s'.", target_table_name)
                     return False
                     
                 rows_loaded += loaded_count
-                last_byte_pos = current_byte_pos
+                last_byte_pos += bytes_processed
                 
                 state["csv_load_progress"][target_table_name] = {
                     "last_byte_pos": last_byte_pos,

@@ -173,6 +173,52 @@ def run_mysqldump_schema(table, output_file):
                 time.sleep(RETRY_DELAY)
     return False
 
+def run_mysqldump_full(table, output_file):
+    """Executes mysqldump to export schema and data for the provided table."""
+    command = [config.MYSQLDUMP_PATH]
+    if config.DB_HOST.lower() not in ['localhost', '127.0.0.1']:
+        command.extend([f"-h{config.DB_HOST}"])
+
+    command.extend([
+        f"-u{config.DB_USER}", f"--password={config.DB_PASSWORD}",
+        "--skip-lock-tables", "--skip-add-locks", "--set-gtid-purged=OFF",
+        config.DB_DATABASE, table
+    ])
+    
+    logger.info("Dumping full table '%s' to %s...", table, output_file)
+    import tempfile
+    
+    t_start = time.time()
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as err_file:
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=err_file, text=False)
+                
+                with open(output_file, "wb") as f, tqdm(desc=f"Dumping SQL {table}", unit="B", unit_scale=True, leave=False) as pbar:
+                    if process.stdout is not None:
+                        while True:
+                            chunk = process.stdout.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            pbar.update(len(chunk))
+                        
+                process.wait()
+                if process.returncode == 0:
+                    logger.info("Successfully dumped schema and data for '%s' in %s.", table, format_time(time.time() - t_start))
+                    time.sleep(0.5)
+                    return True
+                else:
+                    err_file.seek(0)
+                    logger.error("Attempt %s/%s failed full dump '%s': %s", attempt, MAX_RETRIES, table, err_file.read())
+                    if attempt < MAX_RETRIES:
+                        time.sleep(RETRY_DELAY)
+        except Exception as e:
+            logger.error("Attempt %s/%s error during full dump for '%s': %s", attempt, MAX_RETRIES, table, e)
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+    return False
+
 def process_schema_file(input_file, output_file, table_name, suffix):
     """Reads the raw SQL schema dump, updates engine and collation, saves it, and deletes raw file."""
     logger.info("Processing schema file for '%s'...", table_name)
@@ -437,9 +483,18 @@ def load_sql_schema(filepath):
         with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as err_file:
             try:
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err_file, text=False)
-                with open(filepath, 'rb') as f:
-                    process.stdin.write(f.read())
-                process.stdin.close()
+                file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+                with open(filepath, 'rb') as f, tqdm(total=file_size, desc=f"Executing {filename}", unit="B", unit_scale=True, leave=False) as pbar:
+                    while True:
+                        chunk = f.read(1024 * 1024) # Read in 1MB chunks
+                        if not chunk:
+                            break
+                        if process.stdin:
+                            process.stdin.write(chunk)
+                            process.stdin.flush()
+                        pbar.update(len(chunk))
+                if process.stdin:
+                    process.stdin.close()
                 process.wait()
                 
                 if process.returncode == 0:
@@ -1438,6 +1493,100 @@ def choose_destination_database():
             return True
         return False
 
+def run_export_only(tables, suffix, export_format='csv'):
+    folder_name = suffix.strip('_') if suffix else 'v2'
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    export_dir = os.path.join(project_dir, "output", "export", folder_name)
+    os.makedirs(export_dir, exist_ok=True)
+
+    if not tables:
+        print("No tables found to export.")
+        logger.warning("Export aborted: No tables found.")
+        return
+
+    logger.info("Starting export of %d tables to %s format in %s", len(tables), export_format.upper(), export_dir)
+    print(f"\nExporting {len(tables)} tables to {export_format.upper()} in '{export_dir}'...")
+    
+    for table in tqdm(tables, desc="Exporting Tables", unit="table"):
+        target_table_name = table if table.endswith(suffix) else f"{table}{suffix}"
+        
+        if export_format == 'sql':
+            output_file = os.path.join(export_dir, f"{target_table_name}_full.sql")
+            if run_mysqldump_full(table, output_file):
+                logger.info("Successfully exported %s to SQL format.", table)
+                print(f"Exported {table} to SQL successfully.")
+            else:
+                logger.error("Failed to export %s to SQL format.", table)
+                print(f"Failed to export {table} to SQL.")
+        else:
+            raw_schema = os.path.join(export_dir, f"{table}_raw_schema{suffix}.sql")
+            processed_schema = os.path.join(export_dir, f"{target_table_name}_schema.sql")
+            csv_file = os.path.join(export_dir, f"{target_table_name}.csv")
+            
+            if run_mysqldump_schema(table, raw_schema):
+                process_schema_file(raw_schema, processed_schema, table, suffix)
+            
+            success, _ = export_data_to_csv(table, csv_file)
+            if success:
+                logger.info("Successfully exported %s to CSV format.", table)
+                print(f"Exported {table} to CSV and Schema successfully.")
+            else:
+                logger.error("Failed to export %s to CSV format.", table)
+                print(f"Failed to export {table} to CSV format.")
+
+    logger.info("Export completed successfully.")
+    print(f"\nExport completed. Files saved in: {export_dir}")
+
+def run_import_only(import_format, filepath, target_table=None, use_mt=False, headless_action=None):
+    if not os.path.exists(filepath):
+        print(f"File not found: {filepath}")
+        logger.error("Import aborted: File not found %s", filepath)
+        return
+        
+    if import_format == 'sql':
+        logger.info("Starting SQL import from %s", filepath)
+        if create_destination_db():
+            if load_sql_schema(filepath):
+                print("\nSQL file imported successfully.")
+                logger.info("Successfully imported SQL file %s", filepath)
+            else:
+                print("\nFailed to import SQL file. Check logs.")
+                logger.error("Failed to import SQL file %s", filepath)
+                
+    elif import_format == 'csv':
+        if not target_table:
+            logger.warning("Import aborted: No destination table provided.")
+            print("No destination table provided.")
+            return
+            
+        logger.info("Starting CSV import from %s to table %s", filepath, target_table)
+        if create_destination_db():
+            proceed, action, _ = check_and_handle_existing_table(target_table, headless_action=headless_action)
+            if not proceed:
+                print("Import cancelled.")
+                logger.info("Import cancelled by user for table %s", target_table)
+                return
+                
+            # Usual fallback strategy: execute schema if it exists so the table is created
+            if action != 'truncate':
+                schema_path = filepath.replace('.csv', '_schema.sql')
+                if os.path.exists(schema_path):
+                    print(f"\nFound corresponding schema file: {os.path.basename(schema_path)}")
+                    logger.info("Found corresponding schema file %s, executing...", schema_path)
+                    if load_sql_schema(schema_path):
+                        print("Schema loaded successfully.")
+                    else:
+                        print("Failed to load schema. Check logs.")
+                        
+            state = load_state()
+            
+            if load_csv_to_dest(target_table, filepath, state, use_multithreading=use_mt):
+                print(f"\nCSV imported to '{target_table}' successfully.")
+                logger.info("Successfully imported CSV to %s", target_table)
+            else:
+                print("\nFailed to import CSV. Check logs.")
+                logger.error("Failed to import CSV to %s", target_table)
+
 def migration_menu(suffix):
     while True:
         print("\n=============================================")
@@ -1450,10 +1599,12 @@ def migration_menu(suffix):
         print("1. Specify table name pattern (Regular Expression)")
         print("2. Specify exact table names (Comma-separated list)")
         print("3. Migrate from View to Table")
-        print("4. Exit / Back to main menu")
+        print("4. Export Schema and Data only (Download)")
+        print("5. Import Schema or Data from file (Upload)")
+        print("6. Exit / Back to main menu")
         print("=============================================")
         
-        choice = input("Select an option (1-4): ").strip()
+        choice = input("Select an option (1-6): ").strip()
         
         if choice == '1':
             pattern = input("Enter regular expression pattern (e.g., '^lib_.*'): ").strip()
@@ -1508,6 +1659,41 @@ def migration_menu(suffix):
             run_view_to_table_migration(view_name, dest_table_with_suffix, state, suffix, use_multithreading=use_mt)
             
         elif choice == '4':
+            print("\n--- Export Only ---")
+            print("1. Specify pattern")
+            print("2. Specify exact table names")
+            sub_choice = input("Select option (1-2): ").strip()
+            format_choice = input("Select export format (1: SQL Dump, 2: CSV): ").strip()
+            export_format = 'sql' if format_choice == '1' else 'csv'
+            
+            if sub_choice == '1':
+                pattern = input("Enter regular expression pattern (e.g., '^lib_.*'): ").strip()
+                tables = get_lib_tables(pattern=pattern)
+                run_export_only(tables, suffix, export_format)
+            elif sub_choice == '2':
+                tables_input = input("Enter table names separated by commas: ").strip()
+                table_list = [t.strip() for t in tables_input.split(',')]
+                tables = get_lib_tables(from_list=table_list)
+                run_export_only(tables, suffix, export_format)
+                
+        elif choice == '5':
+            print("\n--- Import Data ---")
+            print("1. Import SQL File")
+            print("2. Import CSV File")
+            fmt_choice = input("Select format (1-2): ").strip()
+            import_format = 'sql' if fmt_choice == '1' else 'csv'
+            
+            filepath = input("Enter full path to file: ").strip()
+            target_table = None
+            use_mt = False
+            
+            if import_format == 'csv':
+                target_table = input("Enter destination table name: ").strip()
+                use_mt = input("Use multi-threaded chunking? (y/n): ").strip().lower() == 'y'
+                
+            run_import_only(import_format, filepath, target_table, use_mt)
+            
+        elif choice == '6':
             break
 
 def main():
@@ -1566,19 +1752,30 @@ def main():
             
         use_mt = headless_config.get('multithreaded', False)
         
-        # Determine skip_extract preference from config
-        skip_extract_cfg = headless_config.get('skip_extract', None)
-        headless_skip = None
-        if skip_extract_cfg is True:
-            headless_skip = 'y'
-        elif skip_extract_cfg is False:
-            headless_skip = 'n'
-            
         headless_action = headless_config.get('existing_table_action', None)
         if headless_action not in ['drop', 'truncate', 'skip']:
             headless_action = None
-            
-        run_migration(tables, state, suffix, use_multithreading=use_mt, headless_skip_extract=headless_skip, headless_action=headless_action)
+
+        action = headless_config.get('action', 'migrate')
+        if action == 'export':
+            export_format = headless_config.get('export_format', 'csv')
+            run_export_only(tables, suffix, export_format)
+        elif action == 'import':
+            import_format = headless_config.get('import_format', 'sql')
+            import_filepath = headless_config.get('import_filepath')
+            target_table = headless_config.get('target_table')
+            if not import_filepath:
+                print("Error: import_filepath is required for import action in headless mode.")
+                sys.exit(1)
+            run_import_only(import_format, import_filepath, target_table, use_mt, headless_action)
+        else:
+            skip_extract_cfg = headless_config.get('skip_extract', None)
+            headless_skip = None
+            if skip_extract_cfg is True:
+                headless_skip = 'y'
+            elif skip_extract_cfg is False:
+                headless_skip = 'n'
+            run_migration(tables, state, suffix, use_multithreading=use_mt, headless_skip_extract=headless_skip, headless_action=headless_action)
         sys.exit(0)
 
     while True:

@@ -292,10 +292,8 @@ def process_schema_file(input_file, output_file, table_name, suffix):
 
                 f_out.write(line)
         
-        # Delete the raw schema file as requested
-        if os.path.exists(input_file):
-            os.remove(input_file)
-            logger.info("Deleted raw schema file '%s'.", input_file)
+        # The raw schema file is kept intact as requested
+        logger.info("Kept raw schema file '%s' intact.", input_file)
 
         logger.info("Successfully processed schema for table '%s'.", table_name)
         return True

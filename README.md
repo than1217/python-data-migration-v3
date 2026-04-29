@@ -8,9 +8,10 @@ By avoiding massive `.sql` dump files filled with `INSERT` statements, this util
 - **Low Memory Footprint**: Uses Python's native `mysql.connector` with unbuffered cursors to stream source data directly into chunked `.csv` files.
 - **Optimized Unbuffered Streaming**: Employs server-side cursors (SSCursor) to stream massive tables and views (e.g., 30M+ rows) in linear time ($O(N)$), preventing timeouts and avoiding the exponential slowdown of `LIMIT/OFFSET` pagination.
 - **High-Speed Ingestion**: Leverages MySQL's native `LOAD DATA INFILE` for bulk data loading, falling back to `LOAD DATA LOCAL INFILE` or standard batch `INSERT` logic if server restrictions apply.
+- **Standalone Import/Export**: Easily download schema and data as full SQL dumps or chunked CSVs, and upload them directly to destination databases without running the full migration pipeline.
 - **Multithreaded Data Loading**: Drastically accelerates data insertion by splitting large CSVs into chunks and loading them into the destination database concurrently.
 - **View-to-Table Migration**: Automatically reverse-engineers the schema of a source view, generates a CREATE TABLE statement, and materializes the view as a physical table on the destination server.
-- **Smart Schema Modification**: Automatically extracts source table schemas and updates them for compatibility (InnoDB, utf8mb4) while injecting an optional suffix (e.g., `_v2`, `_v3`) into the target table names.
+- **Smart Schema Modification**: Automatically extracts source table schemas and updates them for compatibility (InnoDB, utf8mb4) while injecting an optional suffix (e.g., `_v2`, `_v3`) into the target table names. Both the intact raw schema and the newly processed schema are preserved for reference.
 - **Interruptible & Resumable**: Automatically logs progress to `csv_migration_state.json`. If a network error or crash occurs mid-migration, simply run the script again to resume precisely where it left off, down to the exact byte in the CSV file.
 - **Detailed Summary Reports**: At the end of a run, a `.csv` report is generated (and seamlessly appended to across multiple runs) in the `output/` directory, detailing table names, execution times, DDL statements used, row counts, and any errors encountered.
 - **Automatic Fallbacks**: Gracefully switches from UNIX Socket to TCP/IP connections if needed, ensuring local migrations are as frictionless as possible.
@@ -24,8 +25,9 @@ python-data-migration-v3/
 ├── output/                     # Generated schema and data artifacts
 │   ├── migration_summary_<suffix>.csv
 │   ├── csv/                    # Exported CSV data chunks
+│   ├── export/                 # Downloaded SQL/CSV files from standalone exports
 │   ├── processed/              # Adjusted SQL schema definitions
-│   └── raw/                    # Temporary raw mysqldump schemas
+│   └── raw/                    # Original intact raw mysqldump schemas
 └── src/
     ├── config.py               # Database connection info and executable paths
     └── table_csv_migration.py  # Main execution script
@@ -46,7 +48,13 @@ Run the interactive console application:
 ```bash
 python src/table_csv_migration.py
 ```
-A menu-driven wizard will guide you through connecting to source and destination databases, supplying a table suffix (e.g., `_v3`), and selecting table patterns (Regex), exact lists to migrate, or migrating specific views to physical tables.
+A menu-driven wizard will guide you through connecting to source and destination databases, supplying a table suffix (e.g., `_v3`), and selecting your desired operation:
+1. Migrate by table name pattern (Regex)
+2. Migrate exact table names
+3. Migrate from View to Table
+4. Export Schema and Data only (Download)
+5. Import Schema or Data from file (Upload)
+6. Exit
 
 ### Headless Mode (Automated)
 You can automate migrations by passing a JSON configuration file via the `--headless` flag. This bypasses all interactive prompts and uses passwords securely read from your `.env` file.
@@ -84,6 +92,34 @@ python src/table_csv_migration.py --headless config.json
   "dest_db_user": "root",
   "tables": ["lib_users", "lib_address"],
   "force_restart": true
+}
+```
+
+**Example `config.json` for Standalone Export:**
+```json
+{
+  "action": "export",
+  "export_format": "sql",
+  "suffix": "_v3",
+  "db_host": "127.0.0.1",
+  "db_database": "source_db_name",
+  "db_user": "root",
+  "pattern": "^lib_.*"
+}
+```
+
+**Example `config.json` for Standalone CSV Import:**
+```json
+{
+  "action": "import",
+  "import_format": "csv",
+  "import_filepath": "C:\\path\\to\\file.csv",
+  "target_table": "lib_address_v3",
+  "existing_table_action": "truncate",
+  "multithreaded": true,
+  "dest_db_host": "10.10.10.133",
+  "dest_db_database": "dest_db_name",
+  "dest_db_user": "dest_user"
 }
 ```
 

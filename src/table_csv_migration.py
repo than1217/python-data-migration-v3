@@ -709,8 +709,25 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             """Wrapper to call the shared chunk processor and return values needed for futures."""
             pos = position_queue.get()
             with tqdm(total=b_processed, desc=f"Chunk {c_id}", position=pos, unit="B", unit_scale=True, leave=False) as pbar_chunk:
+                done_event = threading.Event()
+                def ticker():
+                    while not done_event.is_set():
+                        pbar_chunk.update(0)
+                        done_event.wait(0.5)
+                t = threading.Thread(target=ticker)
+                t.start()
+                
                 success, rows_count = _process_csv_chunk(target_table_name, t_csv, h_list, is_remote_dest)
+                
+                done_event.set()
+                t.join()
                 pbar_chunk.update(b_processed)
+                
+            if success:
+                tqdm.write(f"✓ Chunk {c_id} loaded ({rows_count} rows)")
+            else:
+                tqdm.write(f"✗ Chunk {c_id} failed")
+                
             position_queue.put(pos)
             return success, rows_count, b_processed, c_id
 
@@ -916,10 +933,24 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                 bytes_processed = max(0, actual_chunk_size - header_line_bytes)
                 
                 with tqdm(total=actual_chunk_size, desc=f"Chunk {chunk_idx}", position=2, unit="B", unit_scale=True, leave=False) as pbar_chunk:
+                    done_event = threading.Event()
+                    def ticker():
+                        while not done_event.is_set():
+                            pbar_chunk.update(0)
+                            done_event.wait(0.5)
+                    t = threading.Thread(target=ticker)
+                    t.start()
+                    
                     success, loaded_count = _process_csv_chunk(target_table_name, temp_csv, headers, is_remote_dest)
+                    
+                    done_event.set()
+                    t.join()
                     pbar_chunk.update(actual_chunk_size)
                     
-                if not success:
+                if success:
+                    tqdm.write(f"✓ Chunk {chunk_idx} loaded ({loaded_count} rows)")
+                else:
+                    tqdm.write(f"✗ Chunk {chunk_idx} failed")
                     logger.error("Failed to load chunk for table '%s'.", target_table_name)
                     return False
                     

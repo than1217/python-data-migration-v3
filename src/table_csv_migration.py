@@ -18,7 +18,7 @@ import config
 
 # Set up logging to migration.log
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-log_file = os.path.join(base_dir, "csv_migration.log")
+log_file = os.path.join(base_dir, "migration.log")
 state_file = os.path.join(base_dir, "csv_migration_state.json")
 
 MAX_RETRIES = 3
@@ -732,6 +732,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             print(f"Splitting CSV and preparing chunks for {target_table_name}...")
             # Use the actual file sizes of the generated chunks to update the progress bar to avoid CPU overhead
             
+            mt_total_bytes = 0
             with tqdm(total=file_size, initial=bytes_skipped, desc=f"Preparing Chunks", unit="B", unit_scale=True, leave=False, position=1) as pbar_split:
                 while True:
                     chunk_rows = []
@@ -759,7 +760,8 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                         # Use actual file size of the chunk for accurate tracking
                         actual_chunk_size = os.path.getsize(temp_csv)
                         bytes_for_pbar = max(0, actual_chunk_size - header_line_bytes)
-                        futures.append(executor.submit(process_wrapper, temp_csv, headers, actual_chunk_size, chunk_id))
+                        mt_total_bytes += bytes_for_pbar
+                        futures.append(executor.submit(process_wrapper, temp_csv, headers, bytes_for_pbar, chunk_id))
                         pbar_split.update(bytes_for_pbar)
                         
                     chunk_id += 1
@@ -769,14 +771,14 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
         
         multithread_failed = False
         
-        # Calculate total target bytes to load (sum of all pending chunk sizes)
-        total_bytes_to_load = sum(f.result()[2] if not f.done() else f.result()[2] for f in futures) if futures else file_size
+        # Calculate total target bytes to load
+        total_bytes_to_load = mt_total_bytes if futures else file_size
         
         with tqdm(total=total_bytes_to_load, desc=f"MT Loading {target_table_name}", unit="B", unit_scale=True, leave=False, position=1) as pbar:
             for future in as_completed(futures):
                 success, loaded_count, b_processed, c_id = future.result()
                 if not success:
-                    logger.error("A multithreaded chunk failed to load for table '%s'.", target_table_name)
+                    logger.warning("A multithreaded chunk failed to load for table '%s'. Will fallback to single-threaded mode.", target_table_name)
                     executor.shutdown(wait=False, cancel_futures=True)
                     multithread_failed = True
                     break
@@ -1235,7 +1237,7 @@ def run_migration(tables, state, suffix, use_multithreading=False, headless_skip
         print("No tables found to migrate.")
         return
         
-    print(f"\nMigrating {len(tables)} tables via CSV approach (logging details to csv_migration.log)...")
+    print(f"\nMigrating {len(tables)} tables via CSV approach (logging details to migration.log)...")
     start_time = time.time()
     
     if not create_destination_db():

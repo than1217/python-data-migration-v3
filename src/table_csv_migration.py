@@ -625,6 +625,8 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             )
             if conn.is_connected():
                 cursor = conn.cursor()
+                cursor.execute("SET SESSION net_read_timeout=7200")
+                cursor.execute("SET SESSION net_write_timeout=7200")
                 cursor.execute(f"TRUNCATE TABLE `{target_table_name}`")
                 conn.commit()
                 cursor.close()
@@ -740,6 +742,8 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                 )
                 if conn.is_connected():
                     cursor = conn.cursor()
+                    cursor.execute("SET SESSION net_read_timeout=7200")
+                    cursor.execute("SET SESSION net_write_timeout=7200")
                     cursor.execute(f"TRUNCATE TABLE `{target_table_name}`")
                     conn.commit()
                     cursor.close()
@@ -976,6 +980,13 @@ def check_and_handle_existing_table(table_name, headless_action=None, global_act
                     logger.info("User chose to skip table '%s'. Cancelling migration for this table.", table_name)
                     print(f"Migration for '{table_name}' skipped.")
                     return False, None, global_action
+
+            try:
+                conn.ping(reconnect=True, attempts=3, delay=2)
+                cursor.execute("SET SESSION net_read_timeout=7200")
+                cursor.execute("SET SESSION net_write_timeout=7200")
+            except Error as e:
+                logger.warning("Reconnection or setting timeouts failed: %s", e)
 
             if action == 'drop':
                 logger.info("User chose to drop existing table '%s'.", table_name)

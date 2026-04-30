@@ -15,6 +15,7 @@ import mysql.connector
 from tqdm import tqdm
 from mysql.connector import Error
 import config
+import socket
 
 # Set up logging to migration.log
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,6 +37,29 @@ def format_time(seconds):
     if seconds > 60:
         return f"{seconds / 60:.2f} minutes"
     return f"{seconds:.2f} seconds"
+
+def enable_tcp_keepalive(conn):
+    try:
+        sock = getattr(conn, '_socket', None)
+        if not sock and hasattr(conn, '_cnx'):
+            sock = getattr(conn._cnx, '_socket', None)
+        if not sock and hasattr(conn, '_network'):
+            sock = getattr(conn._network, 'sock', None)
+            
+        if sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if sys.platform == 'linux':
+                # TCP_KEEPIDLE is 4, TCP_KEEPINTVL is 5, TCP_KEEPCNT is 6 on Linux
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPIDLE', 4), 60)
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPINTVL', 5), 10)
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPCNT', 6), 5)
+            elif sys.platform == 'win32':
+                sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60000, 10000))
+            elif sys.platform == 'darwin':
+                # TCP_KEEPALIVE is 0x10 on macOS
+                sock.setsockopt(socket.IPPROTO_TCP, 0x10, 60)
+    except Exception as e:
+        logger.debug("Could not set TCP keepalive: %s", e)
 
 def get_db_connection(host, user, password, database=None, charset=None):
     """Helper to create a MySQL connection, automatically finding the socket file on Linux if localhost."""
@@ -73,6 +97,8 @@ def get_db_connection(host, user, password, database=None, charset=None):
         cursor.close()
     except Exception:
         pass
+
+    enable_tcp_keepalive(conn)
 
     if 'unix_socket' in kwargs:
         logger.info("Database connection established using Unix Socket: %s", kwargs['unix_socket'])
@@ -416,8 +442,10 @@ def export_data_to_csv(table_name, csv_file_path):
                         with conn.cursor(buffered=False) as unbuffered_cursor:
                             try:
                                 # Increase timeouts for long-running streaming queries
-                                unbuffered_cursor.execute("SET SESSION net_read_timeout=7200")
-                                unbuffered_cursor.execute("SET SESSION net_write_timeout=7200")
+                                unbuffered_cursor.execute("SET SESSION net_read_timeout=86400")
+                                unbuffered_cursor.execute("SET SESSION net_write_timeout=86400")
+                                unbuffered_cursor.execute("SET SESSION wait_timeout=86400")
+                                unbuffered_cursor.execute("SET SESSION interactive_timeout=86400")
                             except Error as e:
                                 logger.warning("Could not set session timeouts: %s", e)
                                 

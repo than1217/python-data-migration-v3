@@ -74,7 +74,8 @@ def get_db_connection(host, user, password, database=None, charset=None):
         'user': user,
         'password': password,
         'connect_timeout': 60,
-        'use_pure': True  # Force pure python mode so the raw socket is exposed for TCP keepalive
+        'use_pure': True,  # Force pure python mode so the raw socket is exposed for TCP keepalive
+        'auth_plugin': 'caching_sha2_password' # Force the authentication plugin to handle strict modern auth requirements
     }
     if database:
         kwargs['database'] = database

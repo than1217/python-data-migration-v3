@@ -58,6 +58,22 @@ def get_db_connection(host, user, password, database=None, charset=None):
                 break
                 
     conn = mysql.connector.connect(**kwargs)
+    
+    # Try to disable log_bin and redo_logs for every session, ignoring any privilege errors
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SET SESSION sql_log_bin=0")
+        except Error:
+            pass
+        try:
+            cursor.execute("ALTER INSTANCE DISABLE INNODB REDO_LOG")
+        except Error:
+            pass
+        cursor.close()
+    except Exception:
+        pass
+
     if 'unix_socket' in kwargs:
         logger.info("Database connection established using Unix Socket: %s", kwargs['unix_socket'])
     else:
@@ -514,6 +530,7 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
         config.MYSQL_PATH,
         "--connect_timeout=10",
         "--max_allowed_packet=1G",
+        "-f"
     ]
     
     if use_local:
@@ -534,12 +551,12 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
     import tempfile
     retries = MAX_RETRIES if use_local else 1
     attempt = 1
-    disable_log_bin = True
     
     while attempt <= retries:
-        log_bin_stmt = "SET SESSION sql_log_bin=0;\n    " if disable_log_bin else ""
         sql_command = f"""
-    {log_bin_stmt}SET SESSION sql_mode='';
+    SET SESSION sql_log_bin=0;
+    ALTER INSTANCE DISABLE INNODB REDO_LOG;
+    SET SESSION sql_mode='';
     SET SESSION FOREIGN_KEY_CHECKS=0;
     SET SESSION UNIQUE_CHECKS=0;
     LOAD DATA {local_str}INFILE '{mysql_csv_path}'
@@ -557,17 +574,22 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
                 process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err_file, text=True)
                 process.communicate(sql_command)
                 
-                if process.returncode == 0:
+                err_file.seek(0)
+                error_msg = err_file.read()
+                
+                is_fatal = False
+                if error_msg:
+                    for line in error_msg.splitlines():
+                        if "ERROR " in line or "Error " in line:
+                            # Ignore log_bin and redo_log privilege errors
+                            if any(k in line for k in ["sql_log_bin", "SUPER", "SYSTEM_VARIABLES_ADMIN", "REDO_LOG", "Access denied"]):
+                                continue
+                            is_fatal = True
+                            break
+                            
+                if not is_fatal:
                     return True
                 else:
-                    err_file.seek(0)
-                    error_msg = err_file.read()
-                    
-                    if disable_log_bin and any(k in error_msg for k in ["SUPER", "SYSTEM_VARIABLES_ADMIN", "sql_log_bin", "Access denied"]):
-                        logger.warning("Permission denied to disable sql_log_bin. Retrying with log bin enabled for '%s'.", target_table_name)
-                        disable_log_bin = False
-                        continue
-                        
                     logger.error("Attempt %s/%s failed to load CSV for '%s' (local=%s): %s", attempt, retries, target_table_name, use_local, error_msg)
                     if attempt < retries:
                         time.sleep(RETRY_DELAY)
@@ -590,11 +612,6 @@ def _execute_fallback_insert(target_table_name, headers, rows):
         )
         if conn.is_connected():
             cursor = conn.cursor()
-            try:
-                cursor.execute("SET SESSION sql_log_bin=0")
-            except Error as e:
-                logger.warning("Permission denied to disable sql_log_bin in fallback insert for '%s'. Proceeding with log bin enabled.", target_table_name)
-                
             cursor.execute("SET SESSION sql_mode=''")
             cursor.execute("SET SESSION FOREIGN_KEY_CHECKS=0")
             cursor.execute("SET SESSION UNIQUE_CHECKS=0")
@@ -621,6 +638,61 @@ def _execute_fallback_insert(target_table_name, headers, rows):
             return True
     except Error as e:
         logger.error("Fallback failed to load CSV chunk for '%s': %s", target_table_name, e)
+    return False
+
+def _execute_truncate_table(target_table_name):
+    """Executes TRUNCATE TABLE using the mysql CLI to avoid python driver timeouts on large tables."""
+    command = [
+        config.MYSQL_PATH,
+        "--connect_timeout=10",
+        "--max_allowed_packet=1G",
+        "-f"
+    ]
+    
+    if config.DEST_DB_HOST.lower() not in ['localhost', '127.0.0.1']:
+        command.extend([f"-h{config.DEST_DB_HOST}"])
+    
+    command.extend([
+        f"-u{config.DEST_DB_USER}", f"--password={config.DEST_DB_PASSWORD}", config.DEST_DB_DATABASE
+    ])
+
+    logger.info("Executing TRUNCATE TABLE for '%s' via CLI", target_table_name)
+    
+    import tempfile
+    attempt = 1
+    
+    while attempt <= MAX_RETRIES:
+        sql_command = f"SET SESSION sql_log_bin=0;\nALTER INSTANCE DISABLE INNODB REDO_LOG;\nSET SESSION FOREIGN_KEY_CHECKS=0;\nTRUNCATE TABLE `{target_table_name}`;\n"
+        
+        with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as err_file:
+            try:
+                process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err_file, text=True)
+                process.communicate(sql_command)
+                
+                err_file.seek(0)
+                error_msg = err_file.read()
+                
+                is_fatal = False
+                if error_msg:
+                    for line in error_msg.splitlines():
+                        if "ERROR " in line or "Error " in line:
+                            if any(k in line for k in ["sql_log_bin", "SUPER", "SYSTEM_VARIABLES_ADMIN", "REDO_LOG", "Access denied"]):
+                                continue
+                            is_fatal = True
+                            break
+
+                if not is_fatal:
+                    return True
+                else:
+                    logger.error("Attempt %s/%s failed to truncate '%s': %s", attempt, MAX_RETRIES, target_table_name, error_msg)
+                    if attempt < MAX_RETRIES:
+                        time.sleep(RETRY_DELAY)
+                    attempt += 1
+            except Exception as e:
+                logger.error("Attempt %s/%s unexpected error truncating '%s': %s", attempt, MAX_RETRIES, target_table_name, e)
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY)
+                attempt += 1
     return False
 
 def _process_csv_chunk(target_table_name, t_csv, h_list, is_remote_dest):
@@ -671,27 +743,14 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
 
     if not use_multithreading and completed_chunks:
         logger.warning("Multi-threaded progress found but running single-threaded. Truncating table '%s' to avoid duplicates...", target_table_name)
-        try:
-            conn = get_db_connection(
-                host=config.DEST_DB_HOST, user=config.DEST_DB_USER,
-                password=config.DEST_DB_PASSWORD, database=config.DEST_DB_DATABASE
-            )
-            if conn.is_connected():
-                cursor = conn.cursor()
-                cursor.execute("SET SESSION net_read_timeout=7200")
-                cursor.execute("SET SESSION net_write_timeout=7200")
-                cursor.execute(f"TRUNCATE TABLE `{target_table_name}`")
-                conn.commit()
-                cursor.close()
-                conn.close()
-            last_byte_pos = 0
-            rows_loaded = 0
-            completed_chunks = []
-            state["csv_load_progress"][target_table_name] = {"last_byte_pos": 0, "rows_loaded": 0, "completed_chunks": []}
-            save_state(state)
-        except Exception as e:
-            logger.error("Failed to truncate table '%s': %s", target_table_name, e)
+        if not _execute_truncate_table(target_table_name):
+            logger.error("Failed to truncate table '%s'", target_table_name)
             return False
+        last_byte_pos = 0
+        rows_loaded = 0
+        completed_chunks = []
+        state["csv_load_progress"][target_table_name] = {"last_byte_pos": 0, "rows_loaded": 0, "completed_chunks": []}
+        save_state(state)
 
     if use_multithreading:
         logger.info("Loading CSV into destination table '%s' using MULTI-THREADED chunks (Remote dest: %s)...", target_table_name, is_remote_dest)
@@ -807,31 +866,17 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             return True
         else:
             logger.warning("Multithreaded load for '%s' failed. Falling back to single-threaded mode.", target_table_name)
-            try:
-                conn = get_db_connection(
-                    host=config.DEST_DB_HOST, user=config.DEST_DB_USER,
-                    password=config.DEST_DB_PASSWORD, database=config.DEST_DB_DATABASE
-                )
-                if conn.is_connected():
-                    cursor = conn.cursor()
-                    cursor.execute("SET SESSION net_read_timeout=7200")
-                    cursor.execute("SET SESSION net_write_timeout=7200")
-                    cursor.execute(f"TRUNCATE TABLE `{target_table_name}`")
-                    conn.commit()
-                    cursor.close()
-                    conn.close()
-                    logger.info("Truncated table '%s' for single-threaded retry.", target_table_name)
-
-                # Reset progress for single-threaded mode
-                state["csv_load_progress"][target_table_name] = {"last_byte_pos": 0, "rows_loaded": 0, "completed_chunks": []}
-                save_state(state)
-                last_byte_pos = 0
-                rows_loaded = 0
-                completed_chunks = []
-
-            except Exception as e:
-                logger.error("Failed to truncate table '%s' for retry: %s", target_table_name, e)
+            if not _execute_truncate_table(target_table_name):
+                logger.error("Failed to truncate table '%s' for retry.", target_table_name)
                 return False
+            logger.info("Truncated table '%s' for single-threaded retry.", target_table_name)
+
+            # Reset progress for single-threaded mode
+            state["csv_load_progress"][target_table_name] = {"last_byte_pos": 0, "rows_loaded": 0, "completed_chunks": []}
+            save_state(state)
+            last_byte_pos = 0
+            rows_loaded = 0
+            completed_chunks = []
 
     if last_byte_pos == 0:
         if is_remote_dest:
@@ -1070,8 +1115,8 @@ def check_and_handle_existing_table(table_name, headless_action=None, global_act
                 return True, 'drop', global_action
             elif action == 'truncate':
                 logger.info("User chose to truncate existing table '%s'.", table_name)
-                cursor.execute(f"TRUNCATE TABLE `{table_name}`")
-                conn.commit()
+                if not _execute_truncate_table(table_name):
+                    logger.error("Failed to truncate table '%s' via CLI.", table_name)
                 return True, 'truncate', global_action
 
         return True, 'drop', global_action  # Table doesn't exist, proceed

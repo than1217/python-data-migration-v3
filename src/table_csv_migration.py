@@ -40,15 +40,18 @@ def format_time(seconds):
 
 def enable_tcp_keepalive(conn):
     try:
-        sock = getattr(conn, '_socket', None)
-        if not sock and hasattr(conn, '_cnx'):
-            sock = getattr(conn._cnx, '_socket', None)
-        if not sock and hasattr(conn, '_network'):
-            sock = getattr(conn._network, 'sock', None)
-            
+        sock = None
+        # Retrieve the underlying socket depending on the connector's internal structure
+        if hasattr(conn, '_network') and hasattr(conn._network, 'sock'):
+            sock = conn._network.sock
+        elif hasattr(conn, '_cnx') and hasattr(conn._cnx, '_network'):
+            sock = conn._cnx._network.sock
+        elif hasattr(conn, 'sock'):
+            sock = conn.sock
+
         if sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            if sys.platform == 'linux':
+            if sys.platform.startswith('linux'):
                 # TCP_KEEPIDLE is 4, TCP_KEEPINTVL is 5, TCP_KEEPCNT is 6 on Linux
                 sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPIDLE', 4), 60)
                 sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPINTVL', 5), 10)
@@ -57,9 +60,12 @@ def enable_tcp_keepalive(conn):
                 sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60000, 10000))
             elif sys.platform == 'darwin':
                 # TCP_KEEPALIVE is 0x10 on macOS
-                sock.setsockopt(socket.IPPROTO_TCP, 0x10, 60)
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPALIVE', 0x10), 60)
+            logger.info("TCP Keepalive successfully enabled on connection socket.")
+        else:
+            logger.warning("Could not find underlying socket to enable TCP Keepalive.")
     except Exception as e:
-        logger.debug("Could not set TCP keepalive: %s", e)
+        logger.warning("Failed to set TCP keepalive: %s", e)
 
 def get_db_connection(host, user, password, database=None, charset=None):
     """Helper to create a MySQL connection, automatically finding the socket file on Linux if localhost."""
@@ -67,7 +73,8 @@ def get_db_connection(host, user, password, database=None, charset=None):
         'host': host,
         'user': user,
         'password': password,
-        'connect_timeout': 60
+        'connect_timeout': 60,
+        'use_pure': True  # Force pure python mode so the raw socket is exposed for TCP keepalive
     }
     if database:
         kwargs['database'] = database
@@ -446,6 +453,7 @@ def export_data_to_csv(table_name, csv_file_path):
                                 unbuffered_cursor.execute("SET SESSION net_write_timeout=86400")
                                 unbuffered_cursor.execute("SET SESSION wait_timeout=86400")
                                 unbuffered_cursor.execute("SET SESSION interactive_timeout=86400")
+                                unbuffered_cursor.execute("SET SESSION max_execution_time=0")
                             except Error as e:
                                 logger.warning("Could not set session timeouts: %s", e)
                                 

@@ -1701,12 +1701,45 @@ def run_import_only(import_format, filepath, target_table=None, use_mt=False, he
                 print("\nFailed to import CSV. Check logs.")
                 logger.error("Failed to import CSV to %s", target_table)
 
-def migration_menu(suffix):
+def setup_source_connection(servers, suffix):
+    print(f"\n--- Select Server for PPIS{suffix.replace('_','')} ---")
+    for key, (ip, name) in servers.items():
+        print(f"{key}. {name} ({ip})")
+    print("0. Enter Custom Server IP")
+
+    srv_choice = input("\nSelect server: ").strip()
+    if srv_choice == '0':
+        config.DB_HOST = input("Enter custom IP: ").strip()
+    elif srv_choice in servers:
+        config.DB_HOST = servers[srv_choice][0]
+    else:
+        print("Invalid selection.")
+        return False
+    
+    print("\n--- Source Server Authentication ---")
+    config.DB_USER = input(f"Username [{config.DB_USER}]: ").strip() or config.DB_USER
+    config.DB_PASSWORD = getpass.getpass("Password: ")
+    
+    return choose_database()
+
+def setup_dest_connection():
+    print("\n--- Destination Server Connection ---")
+    config.DEST_DB_HOST = input(f"Enter Destination MySQL Host IP [{config.DEST_DB_HOST}]: ").strip() or config.DEST_DB_HOST
+    config.DEST_DB_USER = input(f"Username [{config.DEST_DB_USER}]: ").strip() or config.DEST_DB_USER
+    config.DEST_DB_PASSWORD = getpass.getpass("Password: ")
+
+    return choose_destination_database()
+
+def migration_menu(suffix, servers):
+    source_connected = False
+    dest_connected = False
+
     while True:
         print("\n=============================================")
         print("    CSV MIGRATION OPTIONS")
-        print(f"    Source DB: {config.DB_DATABASE}")
-        if hasattr(config, 'DEST_DB_DATABASE'):
+        if source_connected and hasattr(config, 'DB_DATABASE'):
+            print(f"    Source DB: {config.DB_DATABASE}")
+        if dest_connected and hasattr(config, 'DEST_DB_DATABASE'):
             print(f"    Dest DB:   {config.DEST_DB_DATABASE}")
         print(f"    Table Suffix: {suffix}")
         print("=============================================")
@@ -1719,6 +1752,28 @@ def migration_menu(suffix):
         print("=============================================")
         
         choice = input("Select an option (1-6): ").strip()
+        
+        if choice == '6':
+            break
+
+        if choice not in ['1', '2', '3', '4', '5']:
+            print("Invalid choice.")
+            continue
+
+        needs_source = choice in ['1', '2', '3', '4']
+        needs_dest = choice in ['1', '2', '3', '5']
+
+        if needs_source and not source_connected:
+            if not setup_source_connection(servers, suffix):
+                print("Source connection failed or aborted.")
+                continue
+            source_connected = True
+
+        if needs_dest and not dest_connected:
+            if not setup_dest_connection():
+                print("Destination connection failed or aborted.")
+                continue
+            dest_connected = True
         
         if choice == '1':
             pattern = input("Enter regular expression pattern (e.g., '^lib_.*'): ").strip()
@@ -1806,9 +1861,6 @@ def migration_menu(suffix):
                 use_mt = input("Use multi-threaded chunking? (y/n): ").strip().lower() == 'y'
                 
             run_import_only(import_format, filepath, target_table, use_mt)
-            
-        elif choice == '6':
-            break
 
 def main():
     parser = argparse.ArgumentParser(description="Python CSV Data Migration Utility")
@@ -1931,31 +1983,7 @@ def main():
                 "1": ("localhost", "Localhost")
             }
             
-        print(f"\n--- Select Server for PPIS{suffix.replace('_','')} ---")
-        for key, (ip, name) in servers.items():
-            print(f"{key}. {name} ({ip})")
-        print("0. Enter Custom Server IP")
-
-        srv_choice = input("\nSelect server: ").strip()
-        if srv_choice == '0':
-            config.DB_HOST = input("Enter custom IP: ").strip()
-        elif srv_choice in servers:
-            config.DB_HOST = servers[srv_choice][0]
-        else:
-            print("Invalid selection.")
-            continue
-        
-        print("\n--- Source Server Authentication ---")
-        config.DB_USER = input(f"Username [{config.DB_USER}]: ").strip() or config.DB_USER
-        config.DB_PASSWORD = getpass.getpass("Password: ")
-        
-        print("\n--- Destination Server Connection ---")
-        config.DEST_DB_HOST = input(f"Enter Destination MySQL Host IP [{config.DEST_DB_HOST}]: ").strip() or config.DEST_DB_HOST
-        config.DEST_DB_USER = input(f"Username [{config.DEST_DB_USER}]: ").strip() or config.DEST_DB_USER
-        config.DEST_DB_PASSWORD = getpass.getpass("Password: ")
-
-        if choose_database() and choose_destination_database():
-            migration_menu(suffix)
+        migration_menu(suffix, servers)
 
 if __name__ == "__main__":
     main()

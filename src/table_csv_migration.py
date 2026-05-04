@@ -98,10 +98,6 @@ def get_db_connection(host, user, password, database=None, charset=None):
             cursor.execute("SET SESSION sql_log_bin=0")
         except Error:
             pass
-        try:
-            cursor.execute("ALTER INSTANCE DISABLE INNODB REDO_LOG")
-        except Error:
-            pass
         cursor.close()
     except Exception:
         pass
@@ -403,19 +399,37 @@ def export_data_to_csv(table_name, csv_file_path):
 
                 # Check for a suitable primary key for chunking
                 pk_col_name = None
-                if not is_view:
-                    cursor.execute(f"SHOW COLUMNS FROM `{table_name}` WHERE `Key` = 'PRI'")
-                    pk_cols = cursor.fetchall()
-                    if len(pk_cols) == 1 and 'int' in pk_cols[0][1]:
-                        pk_col_name = pk_cols[0][0]
+                cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+                all_cols = cursor.fetchall()
+                
+                # 1. Look for explicit integer Primary Key
+                pk_cols = [c for c in all_cols if c[3] == 'PRI' and 'int' in c[1].lower()]
+                if len(pk_cols) == 1:
+                    pk_col_name = pk_cols[0][0]
+                
+                # 2. If it's a view (or lacks a PRI), guess an integer ID column to safely paginate
+                if not pk_col_name:
+                    id_cols = [c for c in all_cols if c[0].lower() == 'id' and 'int' in c[1].lower()]
+                    if len(id_cols) == 1:
+                        pk_col_name = id_cols[0][0]
+                    else:
+                        # 3. Fallback: If the very first column ends with 'id' and is an integer
+                        if all_cols and 'int' in all_cols[0][1].lower() and all_cols[0][0].lower().endswith('id'):
+                            pk_col_name = all_cols[0][0]
                 
                 exact_row_count = 0
                 with tqdm(total=total_rows, desc=desc, unit="row", leave=False, position=1) as pbar:
                     # --- PK Chunking Logic ---
                     if pk_col_name:
-                        logger.info("Using Primary Key chunking for export of table '%s' on column '%s'.", table_name, pk_col_name)
-                        cursor.execute(f"SELECT MIN(`{pk_col_name}`), MAX(`{pk_col_name}`) FROM `{table_name}`")
-                        min_pk, max_pk = cursor.fetchone()
+                        logger.info("Using Primary Key chunking for export of '%s' on column '%s'.", table_name, pk_col_name)
+                        
+                        # Try to get MIN/MAX, but implement a timeout guard in case the view is too heavy
+                        try:
+                            cursor.execute(f"SELECT MIN(`{pk_col_name}`), MAX(`{pk_col_name}`) FROM `{table_name}`")
+                            min_pk, max_pk = cursor.fetchone()
+                        except Error as minmax_err:
+                            logger.warning("Failed to determine MIN/MAX for '%s': %s. Falling back to LIMIT/OFFSET.", table_name, minmax_err)
+                            min_pk, max_pk = None, None
 
                         if min_pk is not None and max_pk is not None:
                             chunk_size = 50000
@@ -440,29 +454,23 @@ def export_data_to_csv(table_name, csv_file_path):
                         else:
                             logger.info("Table '%s' appears empty despite row count. Exporting headers only.", table_name)
 
-                    # --- Fallback to unbuffered streaming for views or tables without a good PK ---
+                    # --- Fallback to pagination (LIMIT/OFFSET) for views or tables without a good PK ---
                     else:
                         if is_view:
-                            logger.info("'%s' is a view, using unbuffered streaming export.", table_name)
+                            logger.info("'%s' is a view, using LIMIT/OFFSET pagination export.", table_name)
                         else:
-                            logger.warning("No suitable single-column integer PK found for '%s'. Using unbuffered streaming export.", table_name)
+                            logger.warning("No suitable single-column integer PK found for '%s'. Using LIMIT/OFFSET pagination. This prevents timeouts on large tables.", table_name)
                         
-                        with conn.cursor(buffered=False) as unbuffered_cursor:
-                            try:
-                                # Increase timeouts for long-running streaming queries
-                                unbuffered_cursor.execute("SET SESSION net_read_timeout=86400")
-                                unbuffered_cursor.execute("SET SESSION net_write_timeout=86400")
-                                unbuffered_cursor.execute("SET SESSION wait_timeout=86400")
-                                unbuffered_cursor.execute("SET SESSION interactive_timeout=86400")
-                                unbuffered_cursor.execute("SET SESSION max_execution_time=0")
-                            except Error as e:
-                                logger.warning("Could not set session timeouts: %s", e)
+                        chunk_size = 50000
+                        offset = 0
+                        
+                        while True:
+                            with conn.cursor(buffered=True) as chunk_cursor:
+                                # Execute a fresh query for each chunk to prevent long-running connection drops
+                                query = f"SELECT * FROM `{table_name}` LIMIT {chunk_size} OFFSET {offset}"
+                                chunk_cursor.execute(query)
+                                rows = chunk_cursor.fetchall()
                                 
-                            query = f"SELECT * FROM `{table_name}`"
-                            unbuffered_cursor.execute(query)
-                            
-                            while True:
-                                rows = unbuffered_cursor.fetchmany(10000)
                                 if not rows:
                                     break
                                     
@@ -470,6 +478,11 @@ def export_data_to_csv(table_name, csv_file_path):
                                 rows_fetched = len(rows)
                                 exact_row_count += rows_fetched
                                 pbar.update(rows_fetched)
+                                
+                                if rows_fetched < chunk_size:
+                                    break
+                                    
+                                offset += chunk_size
 
         logger.info("Successfully exported %d rows from '%s' to CSV in %s.", exact_row_count, table_name, format_time(time.time() - t_start))
         return True, exact_row_count
@@ -592,7 +605,6 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
     while attempt <= retries:
         sql_command = f"""
     SET SESSION sql_log_bin=0;
-    ALTER INSTANCE DISABLE INNODB REDO_LOG;
     SET SESSION sql_mode='';
     SET SESSION FOREIGN_KEY_CHECKS=0;
     SET SESSION UNIQUE_CHECKS=0;
@@ -699,7 +711,7 @@ def _execute_truncate_table(target_table_name):
     attempt = 1
     
     while attempt <= MAX_RETRIES:
-        sql_command = f"SET SESSION sql_log_bin=0;\nALTER INSTANCE DISABLE INNODB REDO_LOG;\nSET SESSION FOREIGN_KEY_CHECKS=0;\nTRUNCATE TABLE `{target_table_name}`;\n"
+        sql_command = f"SET SESSION sql_log_bin=0;\nSET SESSION FOREIGN_KEY_CHECKS=0;\nTRUNCATE TABLE `{target_table_name}`;\n"
         
         with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as err_file:
             try:

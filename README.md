@@ -6,14 +6,17 @@ By avoiding massive `.sql` dump files filled with `INSERT` statements, this util
 
 ## Key Features
 - **Low Memory Footprint**: Uses Python's native `mysql.connector` with unbuffered cursors to stream source data directly into chunked `.csv` files.
-- **Optimized Unbuffered Streaming**: Employs server-side cursors (SSCursor) to stream massive tables and views (e.g., 30M+ rows) in linear time ($O(N)$), preventing timeouts and avoiding the exponential slowdown of `LIMIT/OFFSET` pagination.
-- **High-Speed Ingestion**: Leverages MySQL's native `LOAD DATA INFILE` for bulk data loading, falling back to `LOAD DATA LOCAL INFILE` or standard batch `INSERT` logic if server restrictions apply.
+- **Optimized Chunking & Fallbacks**: Employs Primary Key chunking for rapid table exports. Falls back to `LIMIT/OFFSET` pagination for views or tables lacking clear primary keys to avoid heavy timeouts.
+- **Robust Multiline Support**: The chunker securely handles large multiline text fields containing newlines by enforcing quote-parity checks during the split phase, ensuring records are never sliced mid-string.
+- **Accurate Row Verification**: Parses real-time `mysql` CLI output (`Records: x`) rather than relying on heavy full-table `COUNT(*)` queries or imprecise `information_schema` statistics, ensuring final tallies are 100% exact without database performance hits.
+- **High-Speed Ingestion**: Leverages MySQL's native `LOAD DATA INFILE` for bulk data loading. Falls back to `LOCAL INFILE` or Python-based batch `INSERT` logic seamlessly if standard local loading fails due to server privilege settings (e.g., `--secure-file-priv`).
+- **Trigger Management**: Safely and automatically drops triggers on target tables before inserting data, preventing execution errors and invalid `DEFINER` exceptions (like `Access denied; you need ... SYSTEM_USER privilege`) on the destination schema.
 - **Standalone Import/Export**: Easily download schema and data as full SQL dumps or chunked CSVs, and upload them directly to destination databases without running the full migration pipeline.
 - **Multithreaded Data Loading**: Drastically accelerates data insertion by splitting large CSVs into chunks and loading them into the destination database concurrently. 
 - **Granular Progress Tracking**: Features deeply nested `tqdm` progress bars, giving you live visual insight into multi-threaded chunk execution speeds, schema dump processing, and exact byte counts skipped during resume flows.
 - **View-to-Table Migration**: Automatically reverse-engineers the schema of a source view, generates a CREATE TABLE statement, and materializes the view as a physical table on the destination server.
-- **Smart Schema Modification**: Automatically extracts source table schemas and updates them for compatibility (InnoDB, utf8mb4) while injecting an optional suffix (e.g., `_v2`, `_v3`) into the target table names. Both the intact raw schema and the newly processed schema are preserved for reference.
-- **Interruptible & Resumable**: Automatically logs progress to `csv_migration_state.json`. If a network error or crash occurs mid-migration, simply run the script again to resume precisely where it left off, down to the exact byte in the CSV file.
+- **Smart Schema Modification**: Automatically extracts source table schemas and updates them for compatibility (InnoDB, utf8mb4) while skipping source triggers. Injects an optional suffix (e.g., `_v2`, `_v3`) into target table names. Both the intact raw schema and the newly processed schema are preserved for reference.
+- **Interruptible & Resumable**: Automatically logs progress to `migration_state.json`. If a network error or crash occurs mid-migration, simply run the script again to resume precisely where it left off, down to the exact byte in the CSV file.
 - **Detailed Summary Reports**: At the end of a run, a `.csv` report is generated (and seamlessly appended to across multiple runs) in the `output/` directory, detailing table names, execution times, DDL statements used, row counts, and any errors encountered.
 - **Automatic Fallbacks**: Gracefully switches from UNIX Socket to TCP/IP connections if needed, ensuring local migrations are as frictionless as possible.
 
@@ -22,7 +25,7 @@ By avoiding massive `.sql` dump files filled with `INSERT` statements, this util
 python-data-migration-v3/
 ├── .env                        # Environment variables for credentials (optional)
 ├── requirements.txt            # Python dependencies
-├── csv_migration_state.json    # Auto-generated state file tracking progress
+├── migration_state.json        # Auto-generated state file tracking progress
 ├── output/                     # Generated schema and data artifacts
 │   ├── migration_summary_<suffix>.csv
 │   ├── csv/                    # Exported CSV data chunks
@@ -125,6 +128,6 @@ python src/table_csv_migration.py --headless config.json
 ```
 
 ## State & Resumption
-If the migration halts due to connection timeout or manual interruption (`Ctrl+C`), do not delete `csv_migration_state.json`. 
+If the migration halts due to connection timeout or manual interruption (`Ctrl+C`), do not delete `migration_state.json`. 
 - **Interactive Mode**: Rerun the command or restart the interactive session and select "Yes" when prompted to resume. 
 - **Headless Mode**: The script will automatically detect the state file and resume precisely where it left off. To force a fresh migration and ignore previous progress, add `"force_restart": true` to your `config.json`.

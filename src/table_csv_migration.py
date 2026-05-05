@@ -20,7 +20,7 @@ import socket
 # Set up logging to migration.log
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 log_file = os.path.join(base_dir, "migration.log")
-state_file = os.path.join(base_dir, "csv_migration_state.json")
+state_file = os.path.join(base_dir, "migration_state.json")
 
 MAX_RETRIES = 3
 RETRY_DELAY = 5

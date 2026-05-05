@@ -968,28 +968,15 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             
         if success:
             try:
-                conn = get_db_connection(
-                    host=config.DEST_DB_HOST,
-                    user=config.DEST_DB_USER,
-                    password=config.DEST_DB_PASSWORD,
-                    database=config.DEST_DB_DATABASE
-                )
-                if conn.is_connected():
-                    cursor = conn.cursor()
-                    cursor.execute(f"ANALYZE TABLE `{target_table_name}`")
-                    cursor.fetchall()
-                    cursor.execute(f"SELECT TABLE_ROWS FROM information_schema.tables WHERE table_schema = '{config.DEST_DB_DATABASE}' AND table_name = '{target_table_name}'")
-                    row = cursor.fetchone()
-                    if row and row[0] is not None:
-                        rows_loaded = int(row[0])
-                    cursor.close()
-                    conn.close()
+                # Fast local file row count instead of heavy DB COUNT(*)
+                with open(csv_file_path, 'r', encoding='utf-8') as f:
+                    rows_loaded = sum(1 for _ in f) - 1
             except Exception as e:
-                logger.warning("Could not fetch loaded row count for '%s': %s", target_table_name, e)
+                logger.warning("Could not count CSV lines for '%s': %s", target_table_name, e)
                 
             state["csv_load_progress"][target_table_name] = {
                 "last_byte_pos": file_size,
-                "rows_loaded": rows_loaded
+                "rows_loaded": max(0, rows_loaded)
             }
             save_state(state)
             logger.info("Successfully loaded full CSV into '%s' in %s.", target_table_name, format_time(time.time() - t_start))

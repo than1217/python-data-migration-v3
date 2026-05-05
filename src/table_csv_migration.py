@@ -181,7 +181,7 @@ def run_mysqldump_schema(table, output_file):
 
     command.extend([
         f"-u{config.DB_USER}", f"--password={config.DB_PASSWORD}",
-        "--no-data", "--skip-lock-tables", "--skip-add-locks", "--set-gtid-purged=OFF",
+        "--no-data", "--skip-lock-tables", "--skip-add-locks", "--set-gtid-purged=OFF", "--skip-triggers",
         config.DB_DATABASE, table
     ])
     
@@ -227,7 +227,7 @@ def run_mysqldump_full(table, output_file):
 
     command.extend([
         f"-u{config.DB_USER}", f"--password={config.DB_PASSWORD}",
-        "--skip-lock-tables", "--skip-add-locks", "--set-gtid-purged=OFF",
+        "--skip-lock-tables", "--skip-add-locks", "--set-gtid-purged=OFF", "--skip-triggers",
         config.DB_DATABASE, table
     ])
     
@@ -485,6 +485,7 @@ def export_data_to_csv(table_name, csv_file_path):
                                 offset += chunk_size
 
         logger.info("Successfully exported %d rows from '%s' to CSV in %s.", exact_row_count, table_name, format_time(time.time() - t_start))
+        print(f"Successfully exported {exact_row_count} rows from '{table_name}' to CSV.")
         return True, exact_row_count
 
     except Error as e:
@@ -580,7 +581,8 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
         config.MYSQL_PATH,
         "--connect_timeout=10",
         "--max_allowed_packet=1G",
-        "-f"
+        "-f",
+        "-v", "-v"
     ]
     
     if use_local:
@@ -618,13 +620,17 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
     IGNORE 1 LINES;
     """
         
-        with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as err_file:
+        with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as err_file, \
+             tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as out_file:
             try:
-                process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err_file, text=True)
+                process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out_file, stderr=err_file, text=True)
                 process.communicate(sql_command)
                 
                 err_file.seek(0)
                 error_msg = err_file.read()
+                
+                out_file.seek(0)
+                out_msg = out_file.read()
                 
                 is_fatal = False
                 if error_msg:
@@ -637,7 +643,15 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
                             break
                             
                 if not is_fatal:
-                    return True
+                    imported_rows = 0
+                    match = re.search(r'Records:\s*(\d+)', out_msg)
+                    if match:
+                        imported_rows = int(match.group(1))
+                    elif re.search(r'Query OK,\s*(\d+)\s*rows affected', out_msg):
+                        match2 = re.search(r'Query OK,\s*(\d+)\s*rows affected', out_msg)
+                        if match2:
+                            imported_rows = int(match2.group(1))
+                    return True, imported_rows
                 else:
                     logger.error("Attempt %s/%s failed to load CSV for '%s' (local=%s): %s", attempt, retries, target_table_name, use_local, error_msg)
                     if attempt < retries:
@@ -648,7 +662,7 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
                 if attempt < retries:
                     time.sleep(RETRY_DELAY)
                 attempt += 1
-    return False
+    return False, 0
 
 def _execute_fallback_insert(target_table_name, headers, rows):
     try:
@@ -775,21 +789,14 @@ def _drop_triggers_for_table(target_table_name):
 def _process_csv_chunk(target_table_name, t_csv, h_list, is_remote_dest):
     """Processes a single CSV chunk, trying different loading methods."""
     if is_remote_dest:
-        success = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
+        success, rows_count = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
     else:
-        success = _execute_load_data_infile(target_table_name, t_csv, use_local=False)
+        success, rows_count = _execute_load_data_infile(target_table_name, t_csv, use_local=False)
         if not success:
             logger.info("Standard LOAD DATA INFILE failed for chunk of '%s'. Falling back to LOCAL INFILE...", target_table_name)
-            success = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
+            success, rows_count = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
     
-    rows_count = 0
-    if success:
-        try:
-            with open(t_csv, 'r', encoding='utf-8') as tf:
-                rows_count = sum(1 for _ in tf) - 1
-        except Exception:
-            pass
-    else:
+    if not success:
         logger.info("Falling back to Python mysql.connector for chunk of '%s'...", target_table_name)
         with open(t_csv, 'r', encoding='utf-8') as tf:
             tf.readline()
@@ -873,6 +880,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             
             mt_total_bytes = 0
             with tqdm(total=file_size, initial=bytes_skipped, desc=f"Preparing Chunks", unit="B", unit_scale=True, leave=False, position=1) as pbar_split:
+                in_quotes = False
                 while True:
                     chunk_rows = []
                     is_completed = chunk_id in completed_chunks_set
@@ -881,6 +889,16 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                         line = f.readline()
                         if not line: break
                         chunk_rows.append(line)
+                        
+                        if line.count('"') % 2 != 0:
+                            in_quotes = not in_quotes
+                            
+                        while in_quotes:
+                            next_line = f.readline()
+                            if not next_line: break
+                            chunk_rows.append(next_line)
+                            if next_line.count('"') % 2 != 0:
+                                in_quotes = not in_quotes
                         
                     if not chunk_rows:
                         break
@@ -961,19 +979,12 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
     if last_byte_pos == 0:
         if is_remote_dest:
             logger.info("Destination is remote. Attempting full LOAD DATA LOCAL INFILE for '%s'...", target_table_name)
-            success = _execute_load_data_infile(target_table_name, csv_file_path, use_local=True)
+            success, rows_loaded = _execute_load_data_infile(target_table_name, csv_file_path, use_local=True)
         else:
             logger.info("Attempting full LOAD DATA INFILE for '%s'...", target_table_name)
-            success = _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
+            success, rows_loaded = _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
             
         if success:
-            try:
-                # Fast local file row count instead of heavy DB COUNT(*)
-                with open(csv_file_path, 'r', encoding='utf-8') as f:
-                    rows_loaded = sum(1 for _ in f) - 1
-            except Exception as e:
-                logger.warning("Could not count CSV lines for '%s': %s", target_table_name, e)
-                
             state["csv_load_progress"][target_table_name] = {
                 "last_byte_pos": file_size,
                 "rows_loaded": max(0, rows_loaded)
@@ -1005,6 +1016,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             
         with tqdm(total=file_size, initial=last_byte_pos, desc=f"Loading CSV {target_table_name}", unit="B", unit_scale=True, leave=False, position=1) as pbar:
             chunk_idx = 0
+            in_quotes = False
             while True:
                 chunk_rows = []
                 for _ in range(chunk_size):
@@ -1012,6 +1024,16 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                     if not line:
                         break
                     chunk_rows.append(line)
+                    
+                    if line.count('"') % 2 != 0:
+                        in_quotes = not in_quotes
+                        
+                    while in_quotes:
+                        next_line = f.readline()
+                        if not next_line: break
+                        chunk_rows.append(next_line)
+                        if next_line.count('"') % 2 != 0:
+                            in_quotes = not in_quotes
                     
                 if not chunk_rows:
                     break
@@ -1285,7 +1307,7 @@ def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_m
                 print(f"Using existing CSV file for '{view_name}'.")
             else:
                 print(f"Exporting data from view '{view_name}' to CSV...")
-                export_success, _ = export_data_to_csv(view_name, csv_file)
+                export_success, exact_count = export_data_to_csv(view_name, csv_file)
 
             if not export_success:
                 print(f"Failed to export data from view '{view_name}'. Check logs.")
@@ -1662,10 +1684,10 @@ def run_export_only(tables, suffix, export_format='csv'):
             if run_mysqldump_schema(table, raw_schema):
                 process_schema_file(raw_schema, processed_schema, table, suffix)
             
-            success, _ = export_data_to_csv(table, csv_file)
+            success, exact_count = export_data_to_csv(table, csv_file)
             if success:
-                logger.info("Successfully exported %s to CSV format.", table)
-                print(f"Exported {table} to CSV and Schema successfully.")
+                logger.info("Successfully exported %d rows from %s to CSV format.", exact_count, table)
+                print(f"Exported {table} to CSV ({exact_count} rows) and Schema successfully.")
             else:
                 logger.error("Failed to export %s to CSV format.", table)
                 print(f"Failed to export {table} to CSV format.")

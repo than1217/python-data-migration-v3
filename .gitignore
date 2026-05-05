@@ -9,3 +9,5 @@ venv/
 *.sql
 # Data files
 *.csv
+# Patch files
+*.patch

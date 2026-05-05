@@ -744,6 +744,34 @@ def _execute_truncate_table(target_table_name):
                 attempt += 1
     return False
 
+def _drop_triggers_for_table(target_table_name):
+    """Drops all triggers associated with the target table in the destination database."""
+    try:
+        conn = get_db_connection(
+            host=config.DEST_DB_HOST,
+            user=config.DEST_DB_USER,
+            password=config.DEST_DB_PASSWORD,
+            database=config.DEST_DB_DATABASE
+        )
+        if conn.is_connected():
+            cursor = conn.cursor()
+            cursor.execute(f"SHOW TRIGGERS LIKE '{target_table_name}'")
+            triggers = cursor.fetchall()
+            
+            if triggers:
+                logger.info("Found %d trigger(s) on table '%s'. Dropping them to prevent import errors.", len(triggers), target_table_name)
+                for trigger in triggers:
+                    trigger_name = trigger[0]
+                    cursor.execute(f"DROP TRIGGER IF EXISTS `{trigger_name}`")
+                    logger.info("Dropped trigger: %s", trigger_name)
+            
+            cursor.close()
+            conn.close()
+            return True
+    except Error as e:
+        logger.error("Failed to drop triggers for table '%s': %s", target_table_name, e)
+        return False
+
 def _process_csv_chunk(target_table_name, t_csv, h_list, is_remote_dest):
     """Processes a single CSV chunk, trying different loading methods."""
     if is_remote_dest:
@@ -778,6 +806,9 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
     """Uses LOAD DATA INFILE for the entire CSV, falling back to LOAD DATA LOCAL INFILE in chunks."""
     file_size = os.path.getsize(csv_file_path)
     state.setdefault("csv_load_progress", {})
+    
+    # Drop triggers before starting data load to prevent DEFINER and execution errors
+    _drop_triggers_for_table(target_table_name)
     
     is_remote_dest = config.DEST_DB_HOST.lower() not in ['localhost', '127.0.0.1']
     
@@ -945,8 +976,12 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
                 )
                 if conn.is_connected():
                     cursor = conn.cursor()
-                    cursor.execute(f"SELECT COUNT(*) FROM `{target_table_name}`")
-                    rows_loaded = cursor.fetchone()[0]
+                    cursor.execute(f"ANALYZE TABLE `{target_table_name}`")
+                    cursor.fetchall()
+                    cursor.execute(f"SELECT TABLE_ROWS FROM information_schema.tables WHERE table_schema = '{config.DEST_DB_DATABASE}' AND table_name = '{target_table_name}'")
+                    row = cursor.fetchone()
+                    if row and row[0] is not None:
+                        rows_loaded = int(row[0])
                     cursor.close()
                     conn.close()
             except Exception as e:
@@ -1661,8 +1696,30 @@ def run_import_only(import_format, filepath, target_table=None, use_mt=False, he
         logger.info("Starting SQL import from %s", filepath)
         if create_destination_db():
             if load_sql_schema(filepath):
-                print("\nSQL file imported successfully.")
-                logger.info("Successfully imported SQL file %s", filepath)
+                rows_processed = "Unknown"
+                if target_table:
+                    try:
+                        conn = get_db_connection(
+                            host=config.DEST_DB_HOST,
+                            user=config.DEST_DB_USER,
+                            password=config.DEST_DB_PASSWORD,
+                            database=config.DEST_DB_DATABASE
+                        )
+                        if conn.is_connected():
+                            cursor = conn.cursor()
+                            cursor.execute(f"ANALYZE TABLE `{target_table}`")
+                            cursor.fetchall()
+                            cursor.execute(f"SELECT TABLE_ROWS FROM information_schema.tables WHERE table_schema = '{config.DEST_DB_DATABASE}' AND table_name = '{target_table}'")
+                            row = cursor.fetchone()
+                            if row and row[0] is not None:
+                                rows_processed = f"~{int(row[0])} (approximate)"
+                            cursor.close()
+                            conn.close()
+                    except Exception as e:
+                        logger.warning("Could not fetch loaded row count for '%s': %s", target_table, e)
+                
+                print(f"\nSQL file imported successfully. Total rows processed: {rows_processed}")
+                logger.info("Successfully imported SQL file %s. Total rows processed: %s", filepath, rows_processed)
             else:
                 print("\nFailed to import SQL file. Check logs.")
                 logger.error("Failed to import SQL file %s", filepath)
@@ -1695,8 +1752,9 @@ def run_import_only(import_format, filepath, target_table=None, use_mt=False, he
             state = load_state()
             
             if load_csv_to_dest(target_table, filepath, state, use_multithreading=use_mt):
-                print(f"\nCSV imported to '{target_table}' successfully.")
-                logger.info("Successfully imported CSV to %s", target_table)
+                final_row_count = state.get("csv_load_progress", {}).get(target_table, {}).get("rows_loaded", 0)
+                print(f"\nCSV imported to '{target_table}' successfully. Total rows processed: {final_row_count}")
+                logger.info("Successfully imported CSV to %s. Total rows processed: %d", target_table, final_row_count)
             else:
                 print("\nFailed to import CSV. Check logs.")
                 logger.error("Failed to import CSV to %s", target_table)
@@ -1853,12 +1911,19 @@ def migration_menu(suffix, servers):
             import_format = 'sql' if fmt_choice == '1' else 'csv'
             
             filepath = input("Enter full path to file: ").strip()
-            target_table = None
+            target_table = input("Enter destination table name (optional for SQL, required for CSV): ").strip()
+            if not target_table:
+                target_table = None
             use_mt = False
             
             if import_format == 'csv':
-                target_table = input("Enter destination table name: ").strip()
+                while not target_table:
+                    target_table = input("Destination table name is required for CSV. Enter table name: ").strip()
                 use_mt = input("Use multi-threaded chunking? (y/n): ").strip().lower() == 'y'
+            
+            drop_trigs = input(f"Drop triggers on target table before importing? (y/n) [y]: ").strip().lower()
+            if drop_trigs != 'n' and target_table:
+                 _drop_triggers_for_table(target_table)
                 
             run_import_only(import_format, filepath, target_table, use_mt)
 
@@ -1986,4 +2051,8 @@ def main():
         migration_menu(suffix, servers)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print("\nOperation cancelled. Exiting...")
+        sys.exit(0)

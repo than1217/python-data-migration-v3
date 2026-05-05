@@ -2,5 +2,12 @@
     "processed_tables": [],
     "migrated_tables": [],
     "pattern": null,
-    "from_list": null
+    "from_list": null,
+    "csv_load_progress": {
+        "tbl_hh_roster_v3": {
+            "last_byte_pos": 1341523737,
+            "rows_loaded": 42117828,
+            "completed_chunks": []
+        }
+    }
 }

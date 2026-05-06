@@ -977,7 +977,8 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             completed_chunks = []
 
     logger.info("Loading CSV into destination table '%s' in chunks (Remote dest: %s)...", target_table_name, is_remote_dest)
-    chunk_size = 250000
+    print(f"Loading '{target_table_name}' in chunks (Single-threaded)...")
+    chunk_size = 50000
     temp_dir = tempfile.gettempdir()
     
     with open(csv_file_path, 'r', encoding='utf-8', newline='') as f:
@@ -995,7 +996,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
         else:
             f.seek(last_byte_pos)
             
-        with tqdm(total=file_size, initial=last_byte_pos, desc=f"Loading CSV {target_table_name}", unit="B", unit_scale=True, leave=False, position=1) as pbar:
+        with tqdm(total=file_size, initial=last_byte_pos, desc=f"Loading Chunks {target_table_name}", unit="B", unit_scale=True, leave=False, position=1) as pbar:
             chunk_idx = 0
             in_quotes = False
             while True:

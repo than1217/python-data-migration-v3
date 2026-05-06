@@ -810,7 +810,7 @@ def _process_csv_chunk(target_table_name, t_csv, h_list, is_remote_dest):
     return success, rows_count
 
 def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading=False, num_threads=4):
-    """Uses LOAD DATA INFILE for the entire CSV, falling back to LOAD DATA LOCAL INFILE in chunks."""
+    """Uses LOAD DATA LOCAL INFILE in chunks to provide a progress bar."""
     file_size = os.path.getsize(csv_file_path)
     state.setdefault("csv_load_progress", {})
     
@@ -975,25 +975,6 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             last_byte_pos = 0
             rows_loaded = 0
             completed_chunks = []
-
-    if last_byte_pos == 0:
-        if is_remote_dest:
-            logger.info("Destination is remote. Attempting full LOAD DATA LOCAL INFILE for '%s'...", target_table_name)
-            success, rows_loaded = _execute_load_data_infile(target_table_name, csv_file_path, use_local=True)
-        else:
-            logger.info("Attempting full LOAD DATA INFILE for '%s'...", target_table_name)
-            success, rows_loaded = _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
-            
-        if success:
-            state["csv_load_progress"][target_table_name] = {
-                "last_byte_pos": file_size,
-                "rows_loaded": max(0, rows_loaded)
-            }
-            save_state(state)
-            logger.info("Successfully loaded full CSV into '%s' in %s.", target_table_name, format_time(time.time() - t_start))
-            return True
-            
-        logger.info("Full file LOAD DATA attempt failed. Falling back to chunked loading...")
 
     logger.info("Loading CSV into destination table '%s' in chunks (Remote dest: %s)...", target_table_name, is_remote_dest)
     chunk_size = 250000

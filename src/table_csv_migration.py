@@ -809,7 +809,7 @@ def _process_csv_chunk(target_table_name, t_csv, h_list, is_remote_dest):
         os.remove(t_csv)
     return success, rows_count
 
-def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading=False):
+def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading=False, num_threads=4):
     """Uses LOAD DATA INFILE for the entire CSV, falling back to LOAD DATA LOCAL INFILE in chunks."""
     file_size = os.path.getsize(csv_file_path)
     state.setdefault("csv_load_progress", {})
@@ -852,7 +852,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
             return success, rows_count, b_processed, c_id
 
         futures = []
-        executor = ThreadPoolExecutor(max_workers=4)
+        executor = ThreadPoolExecutor(max_workers=num_threads)
         
         with open(csv_file_path, 'r', encoding='utf-8', newline='') as f:
             header_line = f.readline()
@@ -1235,7 +1235,7 @@ def write_summary_csv(summary_csv_path, summary_data):
     except Exception as e:
         logger.error("Failed to write summary CSV: %s", e)
 
-def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_multithreading=False, headless_action=None):
+def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_multithreading=False, num_threads=4, headless_action=None):
     """Orchestrates the migration of a single view to a destination table."""
     t_start_total = time.time()
     logger.info("Starting migration from view '%s' to table '%s'", view_name, dest_table_name)
@@ -1324,7 +1324,7 @@ def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_m
             print(f"\nResuming migration for table '{dest_table_name}'.")
 
         print(f"Loading data into table '{dest_table_name}'...")
-        if load_csv_to_dest(dest_table_name, csv_file, state, use_multithreading):
+        if load_csv_to_dest(dest_table_name, csv_file, state, use_multithreading, num_threads):
             elapsed_str = format_time(time.time() - t_start_total)
             final_row_count = state.get("csv_load_progress", {}).get(dest_table_name, {}).get("rows_loaded", 0)
             
@@ -1356,7 +1356,7 @@ def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_m
         write_summary_csv(summary_csv_path, summary_data)
         logger.info("View migration summary for '%s' generated with status: %s", dest_table_name, remarks)
 
-def run_migration(tables, state, suffix, use_multithreading=False, headless_skip_extract=None, headless_action=None):
+def run_migration(tables, state, suffix, use_multithreading=False, num_threads=4, headless_skip_extract=None, headless_action=None):
     folder_name = suffix.strip('_') if suffix else 'v2'
 
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1427,7 +1427,7 @@ def run_migration(tables, state, suffix, use_multithreading=False, headless_skip
             
             if export_success:
                 # Skip schema drop/create, go straight to appending CSV data
-                if load_csv_to_dest(target_table_name, csv_file, state, use_multithreading):
+                if load_csv_to_dest(target_table_name, csv_file, state, use_multithreading=use_multithreading, num_threads=num_threads):
                     elapsed = format_time(time.time() - t_start)
                     final_row_count = state.get("csv_load_progress", {}).get(target_table_name, {}).get("rows_loaded", 0)
                     logger.info("Total migration for table '%s' completed in %s (%d rows).", table, elapsed, final_row_count)
@@ -1507,7 +1507,7 @@ def run_migration(tables, state, suffix, use_multithreading=False, headless_skip
                     
                     if load_schema_success:
                         # 5. Load CSV to destination DB
-                        if load_csv_to_dest(target_table_name, csv_file, state, use_multithreading):
+                        if load_csv_to_dest(target_table_name, csv_file, state, use_multithreading=use_multithreading, num_threads=num_threads):
                             elapsed = format_time(time.time() - t_start)
                             final_row_count = state.get("csv_load_progress", {}).get(target_table_name, {}).get("rows_loaded", 0)
                             logger.info("Total migration for table '%s' completed in %s (%d rows).", table, elapsed, final_row_count)
@@ -1695,7 +1695,7 @@ def run_export_only(tables, suffix, export_format='csv'):
     logger.info("Export completed successfully.")
     print(f"\nExport completed. Files saved in: {export_dir}")
 
-def run_import_only(import_format, filepath, target_table=None, use_mt=False, headless_action=None):
+def run_import_only(import_format, filepath, target_table=None, use_mt=False, num_threads=4, headless_action=None):
     if not os.path.exists(filepath):
         print(f"File not found: {filepath}")
         logger.error("Import aborted: File not found %s", filepath)
@@ -1760,7 +1760,7 @@ def run_import_only(import_format, filepath, target_table=None, use_mt=False, he
                         
             state = load_state()
             
-            if load_csv_to_dest(target_table, filepath, state, use_multithreading=use_mt):
+            if load_csv_to_dest(target_table, filepath, state, use_multithreading=use_mt, num_threads=num_threads):
                 final_row_count = state.get("csv_load_progress", {}).get(target_table, {}).get("rows_loaded", 0)
                 print(f"\nCSV imported to '{target_table}' successfully. Total rows processed: {final_row_count}")
                 logger.info("Successfully imported CSV to %s. Total rows processed: %d", target_table, final_row_count)
@@ -1796,6 +1796,21 @@ def setup_dest_connection():
     config.DEST_DB_PASSWORD = getpass.getpass("Password: ")
 
     return choose_destination_database()
+
+def ask_multithreading():
+    use_mt = input("Use multi-threaded chunking for faster data loading? (y/n): ").strip().lower() == 'y'
+    num_threads = 4
+    if use_mt:
+        while True:
+            threads_input = input("How many threads? (2-8) [4]: ").strip()
+            if not threads_input:
+                break
+            if threads_input.isdigit() and 2 <= int(threads_input) <= 8:
+                num_threads = int(threads_input)
+                break
+            else:
+                print("Invalid input. Please enter a number between 2 and 8.")
+    return use_mt, num_threads
 
 def migration_menu(suffix, servers):
     source_connected = False
@@ -1851,9 +1866,9 @@ def migration_menu(suffix, servers):
                 if resume != 'y':
                     state = {"migrated_tables": [], "csv_load_progress": {}, "final_row_counts": {}}
                     save_state(state)
-            use_mt = input("Use multi-threaded chunking for faster data loading? (y/n): ").strip().lower() == 'y'
+            use_mt, num_threads = ask_multithreading()
             tables = get_lib_tables(pattern=pattern)
-            run_migration(tables, state, suffix, use_multithreading=use_mt)
+            run_migration(tables, state, suffix, use_multithreading=use_mt, num_threads=num_threads)
             
         elif choice == '2':
             tables_input = input("Enter table names separated by commas: ").strip()
@@ -1865,9 +1880,9 @@ def migration_menu(suffix, servers):
                 if resume != 'y':
                     state = {"migrated_tables": [], "csv_load_progress": {}, "final_row_counts": {}}
                     save_state(state)
-            use_mt = input("Use multi-threaded chunking for faster data loading? (y/n): ").strip().lower() == 'y'
+            use_mt, num_threads = ask_multithreading()
             tables = get_lib_tables(from_list=table_list)
-            run_migration(tables, state, suffix, use_multithreading=use_mt)
+            run_migration(tables, state, suffix, use_multithreading=use_mt, num_threads=num_threads)
             
         elif choice == '3':
             view_name = input("Enter source view name: ").strip()
@@ -1891,8 +1906,8 @@ def migration_menu(suffix, servers):
                         del state["final_row_counts"][dest_table_with_suffix]
                     save_state(state)
             
-            use_mt = input("Use multi-threaded chunking for faster data loading? (y/n): ").strip().lower() == 'y'
-            run_view_to_table_migration(view_name, dest_table_with_suffix, state, suffix, use_multithreading=use_mt)
+            use_mt, num_threads = ask_multithreading()
+            run_view_to_table_migration(view_name, dest_table_with_suffix, state, suffix, use_multithreading=use_mt, num_threads=num_threads)
             
         elif choice == '4':
             print("\n--- Export Only ---")
@@ -1924,17 +1939,18 @@ def migration_menu(suffix, servers):
             if not target_table:
                 target_table = None
             use_mt = False
+            num_threads = 4
             
             if import_format == 'csv':
                 while not target_table:
                     target_table = input("Destination table name is required for CSV. Enter table name: ").strip()
-                use_mt = input("Use multi-threaded chunking? (y/n): ").strip().lower() == 'y'
+                use_mt, num_threads = ask_multithreading()
             
             drop_trigs = input(f"Drop triggers on target table before importing? (y/n) [y]: ").strip().lower()
             if drop_trigs != 'n' and target_table:
                  _drop_triggers_for_table(target_table)
                 
-            run_import_only(import_format, filepath, target_table, use_mt)
+            run_import_only(import_format, filepath, target_table, use_mt, num_threads)
 
 def main():
     parser = argparse.ArgumentParser(description="Python CSV Data Migration Utility")
@@ -1991,6 +2007,7 @@ def main():
             tables = get_lib_tables(pattern=r'^lib_.*')
             
         use_mt = headless_config.get('multithreaded', False)
+        num_threads = headless_config.get('num_threads', 4)
         
         headless_action = headless_config.get('existing_table_action', None)
         if headless_action not in ['drop', 'truncate', 'skip']:
@@ -2007,7 +2024,7 @@ def main():
             if not import_filepath:
                 print("Error: import_filepath is required for import action in headless mode.")
                 sys.exit(1)
-            run_import_only(import_format, import_filepath, target_table, use_mt, headless_action)
+            run_import_only(import_format, import_filepath, target_table, use_mt, num_threads, headless_action)
         else:
             skip_extract_cfg = headless_config.get('skip_extract', None)
             headless_skip = None
@@ -2015,7 +2032,7 @@ def main():
                 headless_skip = 'y'
             elif skip_extract_cfg is False:
                 headless_skip = 'n'
-            run_migration(tables, state, suffix, use_multithreading=use_mt, headless_skip_extract=headless_skip, headless_action=headless_action)
+            run_migration(tables, state, suffix, use_multithreading=use_mt, num_threads=num_threads, headless_skip_extract=headless_skip, headless_action=headless_action)
         sys.exit(0)
 
     while True:

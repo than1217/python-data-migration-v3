@@ -48,10 +48,17 @@ def enable_tcp_keepalive(conn):
             sock = conn._cnx._network.sock
         elif hasattr(conn, 'sock'):
             sock = conn.sock
+        elif hasattr(conn, '_cmysql') and hasattr(conn._cmysql, 'get_socket'):
+            sock = conn._cmysql.get_socket()
 
         if sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            if sys.platform.startswith('linux'):
+            if isinstance(sock, int):
+                # We only have a file descriptor from C-extension, cannot set python socket options easily
+                # MySQL C-API handles keepalive internally if configured, so we skip manual socket options
+                logger.info("C-extension socket detected. Skipping manual TCP Keepalive.")
+            else:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                if sys.platform.startswith('linux'):
                 # TCP_KEEPIDLE is 4, TCP_KEEPINTVL is 5, TCP_KEEPCNT is 6 on Linux
                 sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPIDLE', 4), 60)
                 sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPINTVL', 5), 10)
@@ -67,14 +74,14 @@ def enable_tcp_keepalive(conn):
     except Exception as e:
         logger.warning("Failed to set TCP keepalive: %s", e)
 
-def get_db_connection(host, user, password, database=None, charset=None):
+def get_db_connection(host, user, password, database=None, charset=None, use_pure=False):
     """Helper to create a MySQL connection, automatically finding the socket file on Linux if localhost."""
     kwargs = {
         'host': host,
         'user': user,
         'password': password,
         'connect_timeout': 60,
-        'use_pure': True,  # Force pure python mode so the raw socket is exposed for TCP keepalive
+        'use_pure': use_pure,  # Set to False to use the fast C-extension for max throughput
         'auth_plugin': 'caching_sha2_password' # Force the authentication plugin to handle strict modern auth requirements
     }
     if database:
@@ -442,7 +449,7 @@ def export_data_to_csv(table_name, csv_file_path):
                                     
                                     rows_in_chunk = 0
                                     while True:
-                                        rows = unbuffered_cursor.fetchmany(10000)
+                                        rows = unbuffered_cursor.fetchmany(50000)
                                         if not rows:
                                             break
                                         writer.writerows(rows)

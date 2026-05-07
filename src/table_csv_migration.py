@@ -432,7 +432,7 @@ def export_data_to_csv(table_name, csv_file_path):
                             min_pk, max_pk = None, None
 
                         if min_pk is not None and max_pk is not None:
-                            chunk_size = 50000
+                            chunk_size = 250000
                             current_pk = min_pk
                             
                             with conn.cursor(buffered=False) as unbuffered_cursor:
@@ -461,7 +461,7 @@ def export_data_to_csv(table_name, csv_file_path):
                         else:
                             logger.warning("No suitable single-column integer PK found for '%s'. Using LIMIT/OFFSET pagination. This prevents timeouts on large tables.", table_name)
                         
-                        chunk_size = 50000
+                        chunk_size = 250000
                         offset = 0
                         
                         while True:
@@ -978,7 +978,7 @@ def load_csv_to_dest(target_table_name, csv_file_path, state, use_multithreading
 
     logger.info("Loading CSV into destination table '%s' in chunks (Remote dest: %s)...", target_table_name, is_remote_dest)
     print(f"Loading '{target_table_name}' in chunks (Single-threaded)...")
-    chunk_size = 50000
+    chunk_size = 250000
     temp_dir = tempfile.gettempdir()
     
     with open(csv_file_path, 'r', encoding='utf-8', newline='') as f:

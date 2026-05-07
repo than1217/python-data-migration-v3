@@ -59,16 +59,16 @@ def enable_tcp_keepalive(conn):
             else:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 if sys.platform.startswith('linux'):
-                # TCP_KEEPIDLE is 4, TCP_KEEPINTVL is 5, TCP_KEEPCNT is 6 on Linux
-                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPIDLE', 4), 60)
-                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPINTVL', 5), 10)
-                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPCNT', 6), 5)
-            elif sys.platform == 'win32':
-                sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60000, 10000))
-            elif sys.platform == 'darwin':
-                # TCP_KEEPALIVE is 0x10 on macOS
-                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPALIVE', 0x10), 60)
-            logger.info("TCP Keepalive successfully enabled on connection socket.")
+                    # TCP_KEEPIDLE is 4, TCP_KEEPINTVL is 5, TCP_KEEPCNT is 6 on Linux
+                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPIDLE', 4), 60)
+                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPINTVL', 5), 10)
+                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPCNT', 6), 5)
+                elif sys.platform == 'win32':
+                    sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60000, 10000))
+                elif sys.platform == 'darwin':
+                    # TCP_KEEPALIVE is 0x10 on macOS
+                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, 'TCP_KEEPALIVE', 0x10), 60)
+                logger.info("TCP Keepalive successfully enabled on connection socket.")
         else:
             logger.warning("Could not find underlying socket to enable TCP Keepalive.")
     except Exception as e:

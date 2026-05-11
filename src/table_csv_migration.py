@@ -426,70 +426,92 @@ def export_data_to_csv(table_name, csv_file_path):
                 
                 exact_row_count = 0
                 with tqdm(total=total_rows, desc=desc, unit="row", leave=False, position=1) as pbar:
-                    # --- PK Chunking Logic ---
-                    if pk_col_name:
-                        logger.info("Using Primary Key chunking for export of '%s' on column '%s'.", table_name, pk_col_name)
-                        
-                        # Try to get MIN/MAX, but implement a timeout guard in case the view is too heavy
+                    if is_view:
+                        logger.info("'%s' is a view. Using unbuffered streaming export to avoid slow OFFSET pagination.", table_name)
                         try:
-                            cursor.execute(f"SELECT MIN(`{pk_col_name}`), MAX(`{pk_col_name}`) FROM `{table_name}`")
-                            min_pk, max_pk = cursor.fetchone()
-                        except Error as minmax_err:
-                            logger.warning("Failed to determine MIN/MAX for '%s': %s. Falling back to LIMIT/OFFSET.", table_name, minmax_err)
-                            min_pk, max_pk = None, None
-
-                        if min_pk is not None and max_pk is not None:
-                            chunk_size = 500000
-                            current_pk = min_pk
-                            
-                            with conn.cursor(buffered=False) as unbuffered_cursor:
-                                while current_pk <= max_pk:
-                                    query = f"SELECT * FROM `{table_name}` WHERE `{pk_col_name}` >= {current_pk} AND `{pk_col_name}` < {current_pk + chunk_size}"
-                                    unbuffered_cursor.execute(query)
-                                    
-                                    rows_in_chunk = 0
-                                    while True:
-                                        rows = unbuffered_cursor.fetchmany(50000)
-                                        if not rows:
-                                            break
-                                        writer.writerows(rows)
-                                        rows_in_chunk += len(rows)
-                                    
-                                    exact_row_count += rows_in_chunk
-                                    pbar.update(rows_in_chunk)
-                                    current_pk += chunk_size
-                        else:
-                            logger.info("Table '%s' appears empty despite row count. Exporting headers only.", table_name)
-
-                    # --- Fallback to pagination (LIMIT/OFFSET) for views or tables without a good PK ---
-                    else:
-                        if is_view:
-                            logger.info("'%s' is a view, using LIMIT/OFFSET pagination export.", table_name)
-                        else:
-                            logger.warning("No suitable single-column integer PK found for '%s'. Using LIMIT/OFFSET pagination. This prevents timeouts on large tables.", table_name)
-                        
-                        chunk_size = 500000
-                        offset = 0
-                        
-                        while True:
-                            with conn.cursor(buffered=True) as chunk_cursor:
-                                # Execute a fresh query for each chunk to prevent long-running connection drops
-                                query = f"SELECT * FROM `{table_name}` LIMIT {chunk_size} OFFSET {offset}"
-                                chunk_cursor.execute(query)
-                                rows = chunk_cursor.fetchall()
-                                
+                            cursor.execute("SET SESSION net_write_timeout=7200")
+                        except Error:
+                            pass
+                        with conn.cursor(buffered=False) as unbuffered_cursor:
+                            unbuffered_cursor.execute(f"SELECT * FROM `{table_name}`")
+                            while True:
+                                rows = unbuffered_cursor.fetchmany(50000)
                                 if not rows:
                                     break
-                                    
                                 writer.writerows(rows)
                                 rows_fetched = len(rows)
                                 exact_row_count += rows_fetched
                                 pbar.update(rows_fetched)
-                                
-                                if rows_fetched < chunk_size:
-                                    break
+                    else:
+                        use_limit_offset = False
+                        # --- PK Chunking Logic ---
+                        if pk_col_name:
+                            logger.info("Using Primary Key chunking for export of '%s' on column '%s'.", table_name, pk_col_name)
+                            
+                            # Try to get MIN/MAX, but implement a timeout guard in case the table is too heavy
+                            try:
+                                cursor.execute("SET SESSION MAX_EXECUTION_TIME=10000")
+                                cursor.execute(f"SELECT MIN(`{pk_col_name}`), MAX(`{pk_col_name}`) FROM `{table_name}`")
+                                min_pk, max_pk = cursor.fetchone()
+                                cursor.execute("SET SESSION MAX_EXECUTION_TIME=0")
+                            except Error as minmax_err:
+                                cursor.execute("SET SESSION MAX_EXECUTION_TIME=0")
+                                logger.warning("Failed to determine MIN/MAX for '%s': %s. Falling back to LIMIT/OFFSET.", table_name, minmax_err)
+                                min_pk, max_pk = None, None
+                                use_limit_offset = True
+
+                            if not use_limit_offset:
+                                if min_pk is not None and max_pk is not None:
+                                    chunk_size = 500000
+                                    current_pk = min_pk
                                     
-                                offset += chunk_size
+                                    with conn.cursor(buffered=False) as unbuffered_cursor:
+                                        while current_pk <= max_pk:
+                                            query = f"SELECT * FROM `{table_name}` WHERE `{pk_col_name}` >= {current_pk} AND `{pk_col_name}` < {current_pk + chunk_size}"
+                                            unbuffered_cursor.execute(query)
+                                            
+                                            rows_in_chunk = 0
+                                            while True:
+                                                rows = unbuffered_cursor.fetchmany(50000)
+                                                if not rows:
+                                                    break
+                                                writer.writerows(rows)
+                                                rows_in_chunk += len(rows)
+                                            
+                                            exact_row_count += rows_in_chunk
+                                            pbar.update(rows_in_chunk)
+                                            current_pk += chunk_size
+                                else:
+                                    logger.info("Table '%s' appears empty. Exporting headers only.", table_name)
+
+                        # --- Fallback to pagination (LIMIT/OFFSET) for tables without a good PK ---
+                        else:
+                            use_limit_offset = True
+                            logger.warning("No suitable single-column integer PK found for '%s'. Using LIMIT/OFFSET pagination. This prevents timeouts on large tables.", table_name)
+                            
+                        if use_limit_offset:
+                            chunk_size = 500000
+                            offset = 0
+                            
+                            while True:
+                                with conn.cursor(buffered=True) as chunk_cursor:
+                                    # Execute a fresh query for each chunk to prevent long-running connection drops
+                                    query = f"SELECT * FROM `{table_name}` LIMIT {chunk_size} OFFSET {offset}"
+                                    chunk_cursor.execute(query)
+                                    rows = chunk_cursor.fetchall()
+                                    
+                                    if not rows:
+                                        break
+                                        
+                                    writer.writerows(rows)
+                                    rows_fetched = len(rows)
+                                    exact_row_count += rows_fetched
+                                    pbar.update(rows_fetched)
+                                    
+                                    if rows_fetched < chunk_size:
+                                        break
+                                        
+                                    offset += chunk_size
 
         logger.info("Successfully exported %d rows from '%s' to CSV in %s.", exact_row_count, table_name, format_time(time.time() - t_start))
         print(f"Successfully exported {exact_row_count} rows from '{table_name}' to CSV.")

@@ -1,6 +1,1 @@
-{
-    "processed_tables": [],
-    "migrated_tables": [],
-    "pattern": null,
-    "from_list": null
-}
+﻿{"processed_tables": [], "migrated_tables": [], "pattern": null, "from_list": null, "csv_load_progress": {}, "final_row_counts": {}}

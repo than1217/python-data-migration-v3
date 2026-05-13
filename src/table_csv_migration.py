@@ -95,8 +95,17 @@ def get_db_connection(host, user, password, database=None, charset=None, use_pur
             if os.path.exists(sock):
                 kwargs['unix_socket'] = sock
                 break
-                
-    conn = mysql.connector.connect(**kwargs)
+    
+    try:
+        conn = mysql.connector.connect(**kwargs)
+    except AttributeError as e:
+        if 'MySQLInterfaceError' in str(e) and 'msg' in str(e):
+            logger.warning("Caught an AttributeError from the C-extension connector, retrying with use_pure=True. This might be due to a bug in the connector. Upgrading mysql-connector-python is recommended.")
+            print("C-extension for mysql-connector failed, retrying with pure Python implementation...")
+            kwargs['use_pure'] = True
+            conn = mysql.connector.connect(**kwargs)
+        else:
+            raise
     
     # Try to disable log_bin and redo_logs for every session, ignoring any privilege errors
     try:

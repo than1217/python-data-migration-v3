@@ -1191,24 +1191,27 @@ def check_and_handle_existing_table(table_name, headless_action=None, global_act
         table_exists = cursor.fetchone() is not None
 
         if table_exists:
-            if headless_action in ['drop', 'truncate', 'skip']:
+            if headless_action in ['drop', 'truncate', 'skip', 'append']:
                 action = headless_action
                 if action == 'skip':
                     logger.info("Headless mode: skipping existing table '%s'.", table_name)
                     print(f"Headless mode: skipping existing table '{table_name}'.")
                     return False, None, global_action
-            elif global_action in ['drop', 'truncate', 'skip']:
+            elif global_action in ['drop', 'truncate', 'skip', 'append']:
                 action = global_action
                 if action == 'skip':
                     return False, None, global_action
             else:
-                choice = input(f"Table '{table_name}' already exists. Drop(d), Truncate(t), Skip(s), All-Drop(ad), All-Truncate(at), All-Skip(as)? (d/t/s/ad/at/as): ").strip().lower()
+                choice = input(f"Table '{table_name}' already exists. Drop(d), Truncate(t), Append(a), Skip(s), All-Drop(ad), All-Truncate(at), All-Append(aa), All-Skip(as)? (d/t/a/s/ad/at/aa/as): ").strip().lower()
                 if choice == 'ad':
                     global_action = 'drop'
                     action = 'drop'
                 elif choice == 'at':
                     global_action = 'truncate'
                     action = 'truncate'
+                elif choice == 'aa':
+                    global_action = 'append'
+                    action = 'append'
                 elif choice == 'as':
                     global_action = 'skip'
                     logger.info("User chose to skip table '%s'.", table_name)
@@ -1217,6 +1220,8 @@ def check_and_handle_existing_table(table_name, headless_action=None, global_act
                     action = 'drop'
                 elif choice == 't':
                     action = 'truncate'
+                elif choice == 'a':
+                    action = 'append'
                 else:
                     logger.info("User chose to skip table '%s'. Cancelling migration for this table.", table_name)
                     print(f"Migration for '{table_name}' skipped.")
@@ -1239,6 +1244,9 @@ def check_and_handle_existing_table(table_name, headless_action=None, global_act
                 if not _execute_truncate_table(table_name):
                     logger.error("Failed to truncate table '%s' via CLI.", table_name)
                 return True, 'truncate', global_action
+            elif action == 'append':
+                logger.info("User chose to append to existing table '%s'.", table_name)
+                return True, 'append', global_action
 
         return True, 'drop', global_action  # Table doesn't exist, proceed
     except Error as e:
@@ -1299,10 +1307,15 @@ def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_m
                 remarks = "Cancelled by user"
                 return
 
-            if action == 'truncate':
-                logger.info("Table '%s' was truncated. Skipping DDL extraction and creation.", dest_table_name)
-                with open(processed_schema, 'w', encoding='utf-8') as f:
-                    f.write("-- Schema extraction skipped due to truncate action.\n")
+            if action in ['truncate', 'append']:
+                if action == 'truncate':
+                    logger.info("Table '%s' was truncated. Skipping DDL extraction and creation.", dest_table_name)
+                    with open(processed_schema, 'w', encoding='utf-8') as f:
+                        f.write("-- Schema extraction skipped due to truncate action.\n")
+                else: # append
+                    logger.info("Table '%s' will be appended to. Skipping DDL extraction and creation.", dest_table_name)
+                    with open(processed_schema, 'w', encoding='utf-8') as f:
+                        f.write("-- Schema extraction skipped due to append action.\n")
             else:
                 ddl = get_view_ddl(view_name, dest_table_name)
                 if not ddl:
@@ -1483,10 +1496,15 @@ def run_migration(tables, state, suffix, use_multithreading=False, num_threads=4
                 continue
 
             schema_success = True
-            if action == 'truncate':
-                logger.info("Table '%s' was truncated. Skipping schema extraction and creation.", target_table_name)
-                with open(processed_schema, 'w', encoding='utf-8') as f:
-                    f.write("-- Schema extraction skipped due to truncate action.\n")
+            if action in ['truncate', 'append']:
+                if action == 'truncate':
+                    logger.info("Table '%s' was truncated. Skipping schema extraction and creation.", target_table_name)
+                    with open(processed_schema, 'w', encoding='utf-8') as f:
+                        f.write("-- Schema extraction skipped due to truncate action.\n")
+                else: # append
+                    logger.info("Table '%s' will be appended to. Skipping schema extraction and creation.", target_table_name)
+                    with open(processed_schema, 'w', encoding='utf-8') as f:
+                        f.write("-- Schema extraction skipped due to append action.\n")
             else:
                 # 1. Dump raw schema
                 if run_mysqldump_schema(table, raw_schema):
@@ -1776,7 +1794,7 @@ def run_import_only(import_format, filepath, target_table=None, use_mt=False, nu
                 return
                 
             # Usual fallback strategy: execute schema if it exists so the table is created
-            if action != 'truncate':
+            if action not in ['truncate', 'append']:
                 schema_path = filepath.replace('.csv', '_schema.sql')
                 if os.path.exists(schema_path):
                     print(f"\nFound corresponding schema file: {os.path.basename(schema_path)}")

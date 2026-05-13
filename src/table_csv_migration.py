@@ -720,7 +720,10 @@ def _execute_fallback_insert(target_table_name, headers, rows):
             charset='utf8mb4'
         )
         if conn.is_connected():
+            conn.ping(reconnect=True, attempts=3, delay=2)
             cursor = conn.cursor()
+            cursor.execute("SET SESSION net_write_timeout=3600")
+            cursor.execute("SET SESSION wait_timeout=3600")
             cursor.execute("SET SESSION sql_mode=''")
             cursor.execute("SET SESSION FOREIGN_KEY_CHECKS=0")
             cursor.execute("SET SESSION UNIQUE_CHECKS=0")

@@ -380,11 +380,17 @@ def export_data_to_csv(table_name, csv_file_path):
         )
 
         with conn.cursor(buffered=True) as cursor:
+            # Get MySQL version
+            cursor.execute("SELECT VERSION()")
+            version_str = cursor.fetchone()[0]
+            mysql_version = tuple(map(int, re.findall(r'^\d+\.\d+\.\d+', version_str)[0].split('.')))
+
             try:
                 cursor.execute("SET SESSION net_read_timeout=10800")
                 cursor.execute("SET SESSION net_write_timeout=10800")
                 cursor.execute("SET SESSION wait_timeout=10800")
-                cursor.execute("SET SESSION MAX_EXECUTION_TIME=0")
+                if mysql_version >= (5, 7, 0):
+                    cursor.execute("SET SESSION MAX_EXECUTION_TIME=0")
             except Error:
                 pass
 
@@ -464,12 +470,15 @@ def export_data_to_csv(table_name, csv_file_path):
                     if strategy == 'pk_chunk':
                         logger.info("Using Primary Key chunking for export of '%s' on column '%s'.", table_name, pk_col_name)
                         try:
-                            cursor.execute("SET SESSION MAX_EXECUTION_TIME=10000")
+                            if mysql_version >= (5, 7, 0):
+                                cursor.execute("SET SESSION MAX_EXECUTION_TIME=10000")
                             cursor.execute(f"SELECT MIN(`{pk_col_name}`), MAX(`{pk_col_name}`) FROM `{table_name}`")
                             min_pk, max_pk = cursor.fetchone()
-                            cursor.execute("SET SESSION MAX_EXECUTION_TIME=0")
+                            if mysql_version >= (5, 7, 0):
+                                cursor.execute("SET SESSION MAX_EXECUTION_TIME=0")
                         except Error as minmax_err:
-                            cursor.execute("SET SESSION MAX_EXECUTION_TIME=0")
+                            if mysql_version >= (5, 7, 0):
+                                cursor.execute("SET SESSION MAX_EXECUTION_TIME=0")
                             logger.warning("Failed to determine MIN/MAX for '%s': %s. Falling back to LIMIT/OFFSET.", table_name, minmax_err)
                             min_pk, max_pk = None, None
                             strategy = 'pagination' # Fallback to pagination on failure

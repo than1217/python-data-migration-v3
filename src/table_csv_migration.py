@@ -555,35 +555,60 @@ def export_data_to_csv(table_name, csv_file_path):
             conn.close()
 
 def create_destination_db():
-    logger.info("Connecting to destination server %s...", config.DEST_DB_HOST)
-    for attempt in range(1, MAX_RETRIES + 1):
+    """Ensures the destination database exists and is configured."""
+    # First, try to connect to the database directly to check if it exists
+    try:
+        conn_check = get_db_connection(
+            host=config.DEST_DB_HOST, user=config.DEST_DB_USER,
+            password=config.DEST_DB_PASSWORD, database=config.DEST_DB_DATABASE,
+            use_pure=True
+        )
+        # If this succeeds, DB exists.
+        logger.info("Destination database '%s' already exists.", config.DEST_DB_DATABASE)
         try:
-            conn = get_db_connection(
+            with conn_check.cursor() as cursor:
+                cursor.execute("SET GLOBAL local_infile=1")
+                logger.info("Successfully enabled local_infile on destination server.")
+        except Error as e:
+            logger.warning("Could not set GLOBAL local_infile=1. It might already be enabled or lack permissions: %s", e)
+        finally:
+            conn_check.close()
+        return True
+    except Error as e:
+        if e.errno != 1049:  # Error 1049: Unknown database
+            # For any other error, we log it and fail.
+            logger.error("An unexpected error occurred while checking for destination DB: %s", e)
+            return False
+        # If we get a 1049, we proceed to create it.
+        logger.info("Database '%s' does not exist. It will be created.", config.DEST_DB_DATABASE)
+
+    # If we get here, the database needs to be created.
+    for attempt in range(1, MAX_RETRIES + 1):
+        conn_create = None
+        try:
+            # Connect without a database selected
+            conn_create = get_db_connection(
                 host=config.DEST_DB_HOST,
                 user=config.DEST_DB_USER,
                 password=config.DEST_DB_PASSWORD,
                 use_pure=True
             )
-            if conn.is_connected():
-                cursor = conn.cursor()
-                cursor.execute(f"CREATE DATABASE IF NOT EXISTS {config.DEST_DB_DATABASE} CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci")
-                logger.info("Database '%s' ensured on destination.", config.DEST_DB_DATABASE)
+            with conn_create.cursor() as cursor:
+                cursor.execute(f"CREATE DATABASE {config.DEST_DB_DATABASE} CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci")
+                logger.info("Database '%s' created on destination.", config.DEST_DB_DATABASE)
                 try:
                     cursor.execute("SET GLOBAL local_infile=1")
                     logger.info("Successfully enabled local_infile on destination server.")
                 except Error as e:
-                    logger.warning("Could not set GLOBAL local_infile=1. It might already be enabled or lack permissions: %s", e)
-                cursor.close()
-                conn.close()
-                return True
+                    logger.warning("Could not set GLOBAL local_infile=1: %s", e)
+            return True
         except Error as e:
             logger.error("Attempt %s/%s - Error creating destination DB: %s", attempt, MAX_RETRIES, e)
-            if e.errno == 2002 and config.DEST_DB_HOST.lower() == 'localhost':
-                logger.warning("Socket connection failed for destination DB creation. Falling back to TCP/IP via 127.0.0.1")
-                config.DEST_DB_HOST = '127.0.0.1'
-                
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
+        finally:
+            if conn_create and conn_create.is_connected():
+                conn_create.close()
     return False
 
 def load_sql_schema(filepath):

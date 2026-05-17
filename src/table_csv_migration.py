@@ -561,7 +561,8 @@ def create_destination_db():
             conn = get_db_connection(
                 host=config.DEST_DB_HOST,
                 user=config.DEST_DB_USER,
-                password=config.DEST_DB_PASSWORD
+                password=config.DEST_DB_PASSWORD,
+                use_pure=True
             )
             if conn.is_connected():
                 cursor = conn.cursor()
@@ -726,7 +727,8 @@ def _execute_fallback_insert(target_table_name, headers, rows):
             user=config.DEST_DB_USER,
             password=config.DEST_DB_PASSWORD,
             database=config.DEST_DB_DATABASE,
-            charset='utf8mb4'
+            charset='utf8mb4',
+            use_pure=True
         )
         if conn.is_connected():
             conn.ping(reconnect=True, attempts=3, delay=2)
@@ -823,7 +825,8 @@ def _drop_triggers_for_table(target_table_name):
             host=config.DEST_DB_HOST,
             user=config.DEST_DB_USER,
             password=config.DEST_DB_PASSWORD,
-            database=config.DEST_DB_DATABASE
+            database=config.DEST_DB_DATABASE,
+            use_pure=True
         )
         if conn.is_connected():
             cursor = conn.cursor()
@@ -1193,7 +1196,8 @@ def check_and_handle_existing_table(table_name, headless_action=None, global_act
     try:
         conn = get_db_connection(
             host=config.DEST_DB_HOST, user=config.DEST_DB_USER,
-            password=config.DEST_DB_PASSWORD, database=config.DEST_DB_DATABASE
+            password=config.DEST_DB_PASSWORD, database=config.DEST_DB_DATABASE,
+            use_pure=True
         )
         if not conn.is_connected():
             return False, None, global_action
@@ -1667,7 +1671,8 @@ def choose_destination_database():
         conn = get_db_connection(
             host=config.DEST_DB_HOST,
             user=config.DEST_DB_USER,
-            password=config.DEST_DB_PASSWORD
+            password=config.DEST_DB_PASSWORD,
+            use_pure=True
         )
         if conn.is_connected():
             cursor = conn.cursor()
@@ -1770,7 +1775,8 @@ def run_import_only(import_format, filepath, target_table=None, use_mt=False, nu
                             host=config.DEST_DB_HOST,
                             user=config.DEST_DB_USER,
                             password=config.DEST_DB_PASSWORD,
-                            database=config.DEST_DB_DATABASE
+                            database=config.DEST_DB_DATABASE,
+                            use_pure=True
                         )
                         if conn.is_connected():
                             cursor = conn.cursor()

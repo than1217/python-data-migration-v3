@@ -657,7 +657,7 @@ def load_sql_schema(filepath):
                     time.sleep(RETRY_DELAY)
     return False
 
-def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False):
+def _execute_load_data_infile(target_table_name, csv_file_path, headers=None, use_local=False):
     command = [
         config.MYSQL_PATH,
         "--connect_timeout=10",
@@ -686,13 +686,14 @@ def _execute_load_data_infile(target_table_name, csv_file_path, use_local=False)
     attempt = 1
     
     while attempt <= retries:
+        col_names = f"({', '.join([f'`{h}`' for h in headers])})" if headers else ""
         sql_command = f"""
     SET SESSION sql_log_bin=0;
     SET SESSION sql_mode='';
     SET SESSION FOREIGN_KEY_CHECKS=0;
     SET SESSION UNIQUE_CHECKS=0;
     LOAD DATA {local_str}INFILE '{mysql_csv_path}'
-    IGNORE INTO TABLE `{target_table_name}`
+    IGNORE INTO TABLE `{target_table_name}` {col_names}
     CHARACTER SET utf8mb4
     FIELDS TERMINATED BY ','
     ENCLOSED BY '"'
@@ -875,12 +876,12 @@ def _drop_triggers_for_table(target_table_name):
 def _process_csv_chunk(target_table_name, t_csv, h_list, is_remote_dest):
     """Processes a single CSV chunk, trying different loading methods."""
     if is_remote_dest:
-        success, rows_count = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
+        success, rows_count = _execute_load_data_infile(target_table_name, t_csv, h_list, use_local=True)
     else:
-        success, rows_count = _execute_load_data_infile(target_table_name, t_csv, use_local=False)
+        success, rows_count = _execute_load_data_infile(target_table_name, t_csv, h_list, use_local=False)
         if not success:
             logger.info("Standard LOAD DATA INFILE failed for chunk of '%s'. Falling back to LOCAL INFILE...", target_table_name)
-            success, rows_count = _execute_load_data_infile(target_table_name, t_csv, use_local=True)
+            success, rows_count = _execute_load_data_infile(target_table_name, t_csv, h_list, use_local=True)
     
     if not success:
         logger.info("Falling back to Python mysql.connector for chunk of '%s'...", target_table_name)

@@ -693,13 +693,13 @@ def _execute_load_data_infile(target_table_name, csv_file_path, headers=None, us
     SET SESSION FOREIGN_KEY_CHECKS=0;
     SET SESSION UNIQUE_CHECKS=0;
     LOAD DATA {local_str}INFILE '{mysql_csv_path}'
-    IGNORE INTO TABLE `{target_table_name}` {col_names}
+    IGNORE INTO TABLE `{target_table_name}`
     CHARACTER SET utf8mb4
     FIELDS TERMINATED BY ','
     ENCLOSED BY '"'
     ESCAPED BY '"'
     LINES TERMINATED BY '\\r\\n'
-    IGNORE 1 LINES;
+    IGNORE 1 LINES {col_names};
     """
         
         with tempfile.TemporaryFile(mode='w+', encoding='utf-8', errors='ignore') as err_file, \

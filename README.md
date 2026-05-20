@@ -1,135 +1,142 @@
-# Python CSV Data Migration Utility
+# Python Data Migration Utility
 
-This utility is a highly efficient, chunk-based CSV data migration tool for MySQL databases. It streams data out of a source database into local CSV files, adjusts schema options for compatibility (forcing `InnoDB`, `utf8mb4` character set, `utf8mb4_0900_ai_ci` collation, and `DYNAMIC` row format), and rapidly loads the data into a destination database using `LOAD DATA INFILE`.
+This utility is a high-performance, resilient, and feature-rich data migration tool for MySQL databases. It is designed to handle large-scale data transfers efficiently by leveraging chunk-based CSV processing, multi-threading, and robust error handling. It avoids the pitfalls of traditional `mysqldump` files by streaming data, which minimizes memory usage and dramatically reduces migration times.
 
-By avoiding massive `.sql` dump files filled with `INSERT` statements, this utility avoids memory spikes, dramatically reduces export/import times, and easily recovers from connection drops or process interruptions via a robust state-tracking system.
+The tool can be run in a user-friendly interactive mode or fully automated via a JSON configuration for headless execution.
 
 ## Key Features
-- **High-Speed Extraction**: Utilizes the `mysql-connector-python` C-extension (bypassing the pure Python implementation and GIL) to parse network packets natively in C, drastically reducing CPU bottlenecks and achieving extraction speeds of 100k-300k+ rows per second.
-- **Low Memory Footprint**: Uses unbuffered cursors with optimized chunk buffers to stream source data directly into chunked `.csv` files without memory spikes.
-- **Optimized Chunking & Fallbacks**: Employs Primary Key chunking for rapid table exports. Falls back to `LIMIT/OFFSET` pagination for views or tables lacking clear primary keys to avoid heavy timeouts.
-- **Timeout Resilience**: Automatically sets aggressive MySQL session timeouts (`net_read_timeout`, `net_write_timeout`, `wait_timeout` up to 3 hours, and `MAX_EXECUTION_TIME=0`) to ensure robust export streaming for complex views without dropping connections midway.
-- **Robust Multiline Support**: The chunker securely handles large multiline text fields containing newlines by enforcing quote-parity checks during the split phase, ensuring records are never sliced mid-string.
-- **Accurate Row Verification**: Parses real-time `mysql` CLI output (`Records: x`) rather than relying on heavy full-table `COUNT(*)` queries or imprecise `information_schema` statistics, ensuring final tallies are 100% exact without database performance hits.
-- **High-Speed Ingestion**: Leverages MySQL's native `LOAD DATA INFILE` for bulk data loading. Falls back to `LOCAL INFILE` or Python-based batch `INSERT` logic seamlessly if standard local loading fails due to server privilege settings (e.g., `--secure-file-priv`).
-- **Trigger Management**: Safely and automatically drops triggers on target tables before inserting data, preventing execution errors and invalid `DEFINER` exceptions (like `Access denied; you need ... SYSTEM_USER privilege`) on the destination schema.
-- **Standalone Import/Export**: Easily download schema and data as full SQL dumps or chunked CSVs, and upload them directly to destination databases without running the full migration pipeline.
-- **Multithreaded Data Loading**: Drastically accelerates data insertion by splitting large CSVs into chunks and loading them into the destination database concurrently. 
-- **Granular Progress Tracking**: Features deeply nested `tqdm` progress bars, giving you live visual insight into multi-threaded chunk execution speeds, schema dump processing, and exact byte counts skipped during resume flows.
-- **View-to-Table Migration**: Automatically reverse-engineers the schema of a source view, generates a CREATE TABLE statement, and materializes the view as a physical table on the destination server.
-- **Smart Schema Modification**: Automatically extracts source table schemas and updates them for compatibility (InnoDB, utf8mb4) while skipping source triggers. Injects an optional suffix (e.g., `_v2`, `_v3`) into target table names. Both the intact raw schema and the newly processed schema are preserved for reference.
-- **Interruptible & Resumable**: Automatically logs progress to `migration_state.json`. If a network error or crash occurs mid-migration, simply run the script again to resume precisely where it left off, down to the exact byte in the CSV file.
-- **Detailed Summary Reports**: At the end of a run, a `.csv` report is generated (and seamlessly appended to across multiple runs) in the `output/` directory, detailing table names, execution times, DDL statements used, row counts, and any errors encountered.
-- **Automatic Fallbacks**: Gracefully switches from UNIX Socket to TCP/IP connections if needed, ensuring local migrations are as frictionless as possible.
+
+- **High-Speed Data Transfer**: Achieves rapid data extraction (100k-300k+ rows/sec) by using the `mysql-connector-python` C-extension and high-speed `LOAD DATA INFILE` for ingestion.
+- **Low Memory Footprint**: Streams data using unbuffered cursors and chunking to prevent memory spikes, even with terabyte-scale tables.
+- **Multi-threaded Loading**: Drastically accelerates data insertion by splitting large CSV files into chunks and loading them into the destination database concurrently.
+- **Intelligent Chunking & Fallbacks**: Uses Primary Key chunking for optimal export speed. Automatically falls back to `LIMIT/OFFSET` pagination for views or tables without a suitable primary key.
+- **Resilient & Resumable**: Tracks progress in a `migration_state.json` file. If the process is interrupted, it can be resumed exactly where it left off, down to the byte.
+- **Comprehensive Migration Modes**:
+    - **Single Table/View Migration**: Migrate individual tables or views with fine-grained control.
+    - **Batch Migration**: Migrate multiple tables at once using a regex pattern or a comma-separated list.
+    - **View-to-Table Materialization**: Automatically generates a `CREATE TABLE` statement from a source view and migrates the data into a physical table.
+    - **Multi-Table Merge**: Merges data from multiple source tables or views into a single destination table. The schema is inferred from the first source table, and data from all other sources is appended.
+- **Standalone Operations**:
+    - **Export**: Download schema and data as full SQL dumps or chunked CSVs.
+    - **Import**: Upload data from a local SQL or CSV file directly to the destination.
+- **Smart Schema Handling**: Automatically extracts and modifies source schemas for compatibility (e.g., forcing InnoDB, utf8mb4) and can add a suffix to table names (e.g., `_v2`, `_v3`).
+- **Automatic Trigger Management**: Drops triggers on target tables before loading data to prevent execution errors and `DEFINER` permission issues.
+- **Detailed Reporting**: Generates a `migration_summary.csv` file with detailed statistics for each run, including execution times, row counts, DDL statements, and success/failure remarks.
+- **User-Friendly Interface**: Offers both an interactive, menu-driven CLI for ease of use and a headless mode for automation.
 
 ## Project Structure
-```text
+
+```
 python-data-migration-v3/
-├── .env                        # Environment variables for credentials (optional)
+├── .env                        # (Optional) Environment variables for credentials
 ├── requirements.txt            # Python dependencies
-├── migration_state.json        # Auto-generated state file tracking progress
-├── output/                     # Generated schema and data artifacts
+├── migration_state.json        # Auto-generated state file to track progress
+├── output/
 │   ├── migration_summary_<suffix>.csv
-│   ├── csv/                    # Exported CSV data chunks
-│   ├── export/                 # Downloaded SQL/CSV files from standalone exports
-│   ├── processed/              # Adjusted SQL schema definitions
-│   └── raw/                    # Original intact raw mysqldump schemas
+│   ├── csv/                    # Exported CSV data files
+│   ├── export/                 # Files from standalone export operations
+│   ├── processed/              # Modified SQL schema files
+│   └── raw/                    # Original (raw) SQL schema files
 └── src/
-    ├── config.py               # Database connection info and executable paths
-    └── table_csv_migration.py  # Main execution script
+    ├── config.py               # Database connections and executable paths
+    └── table_csv_migration.py  # The main script
 ```
 
 ## Setup
-1. Create a Python virtual environment: `python -m venv venv`
-2. Activate the virtual environment:
-   - Windows: `venv\Scripts\activate`
-   - Mac/Linux: `source venv/bin/activate`
-3. Install dependencies: `pip install -r requirements.txt`
-4. Update `src/config.py` with default database connection details or create a `.env` file containing variables like `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DEST_DB_HOST`, etc.
+
+1.  **Create a virtual environment**:
+    ```bash
+    python -m venv venv
+    ```
+2.  **Activate it**:
+    -   Windows: `venv\Scripts\activate`
+    -   macOS/Linux: `source venv/bin/activate`
+3.  **Install dependencies**:
+    ```bash
+    pip install -r requirements.txt
+    ```
+4.  **Configure connections**:
+    -   Update `src/config.py` with your default database credentials.
+    -   *Alternatively*, create a `.env` file in the project root for sensitive information like passwords (e.g., `DB_PASSWORD="your_pass"`).
 
 ## Usage
 
 ### Interactive Mode
-Run the interactive console application:
+
+To start the menu-driven interface, run:
 ```bash
 python src/table_csv_migration.py
 ```
-A menu-driven wizard will guide you through connecting to source and destination databases, supplying a table suffix (e.g., `_v3`), and selecting your desired operation:
-1. Migrate by table name pattern (Regex)
-2. Migrate exact table names
-3. Migrate from View to Table
-4. Export Schema and Data only (Download)
-5. Import Schema or Data from file (Upload)
-6. Exit
 
-### Headless Mode (Automated)
-You can automate migrations by passing a JSON configuration file via the `--headless` flag. This bypasses all interactive prompts and uses passwords securely read from your `.env` file.
+You will be guided through selecting the migration type (e.g., PPISv2, PPISv3), connecting to source and destination databases, and choosing a migration operation.
+
+**Main Menu Options:**
+1.  **PPISv2 / PPISv3 / Custom**: Choose a predefined configuration or a custom one.
+    -   **Specify pattern**: Migrate all tables matching a regex.
+    -   **Specify exact names**: Migrate a comma-separated list of tables.
+    -   **Migrate from View to Table**: Materialize a single view.
+    -   **Merge Multiple Tables/Views**: Load data from multiple sources into one destination table.
+    -   **Export Only**: Download data as SQL or CSV.
+    -   **Import Only**: Upload data from a local SQL or CSV file.
+
+### Headless Mode (for Automation)
+
+Automate migrations using a JSON configuration file with the `--headless` flag.
 
 ```bash
 python src/table_csv_migration.py --headless config.json
 ```
 
-**Example `config.json` using a regex pattern:**
+**Example `config.json` for a standard migration:**
 ```json
 {
   "suffix": "_v3",
   "db_host": "10.10.10.96",
-  "db_database": "source_db_name",
+  "db_database": "source_db",
   "db_user": "source_user",
   "dest_db_host": "10.10.10.133",
-  "dest_db_database": "dest_db_name",
+  "dest_db_database": "dest_db",
   "dest_db_user": "dest_user",
   "pattern": "^lib_.*",
   "multithreaded": true,
-  "skip_extract": false,
+  "existing_table_action": "truncate",
   "force_restart": false
 }
 ```
 
-**Example `config.json` using an exact list of tables:**
+**Example `config.json` for a multi-table merge:**
 ```json
 {
-  "suffix": "_v2",
-  "db_host": "127.0.0.1",
-  "db_database": "source_db_name",
-  "db_user": "root",
-  "dest_db_host": "127.0.0.1",
-  "dest_db_database": "dest_db_name",
-  "dest_db_user": "root",
-  "tables": ["lib_users", "lib_address"],
-  "force_restart": true
-}
-```
-
-**Example `config.json` for Standalone Export:**
-```json
-{
-  "action": "export",
-  "export_format": "sql",
+  "action": "merge",
   "suffix": "_v3",
-  "db_host": "127.0.0.1",
-  "db_database": "source_db_name",
-  "db_user": "root",
-  "pattern": "^lib_.*"
-}
-```
-
-**Example `config.json` for Standalone CSV Import:**
-```json
-{
-  "action": "import",
-  "import_format": "csv",
-  "import_filepath": "C:\\path\\to\\file.csv",
-  "target_table": "lib_address_v3",
-  "existing_table_action": "truncate",
-  "multithreaded": true,
+  "source_tables": ["quarter1_sales", "quarter2_sales", "quarter3_sales_v"],
+  "dest_table": "annual_sales_report",
+  "db_host": "10.10.10.96",
+  "db_database": "source_db",
+  "db_user": "source_user",
   "dest_db_host": "10.10.10.133",
-  "dest_db_database": "dest_db_name",
+  "dest_db_database": "dest_db",
   "dest_db_user": "dest_user"
 }
 ```
 
-## State & Resumption
-If the migration halts due to connection timeout or manual interruption (`Ctrl+C`), do not delete `migration_state.json`. 
-- **Interactive Mode**: Rerun the command or restart the interactive session and select "Yes" when prompted to resume. 
-- **Headless Mode**: The script will automatically detect the state file and resume precisely where it left off. To force a fresh migration and ignore previous progress, add `"force_restart": true` to your `config.json`.
+| Headless Config Key         | Description                                                                    |
+| --------------------------- | ------------------------------------------------------------------------------ |
+| `action`                    | `migrate` (default), `merge`, `export`, or `import`.                           |
+| `suffix`                    | Suffix to add to destination table names (e.g., `_v3`).                        |
+| `db_host`, `db_user`, etc.  | Source and destination database connection details.                            |
+| `pattern`                   | Regex pattern for selecting tables.                                            |
+| `tables` / `source_tables`  | A list of exact table/view names.                                              |
+| `dest_table`                | The single destination table for a merge operation.                            |
+| `multithreaded`             | `true` to enable multi-threaded CSV loading.                                   |
+| `num_threads`               | Number of threads to use (default 4).                                          |
+| `existing_table_action`     | What to do if a table exists: `drop`, `truncate`, `skip`, or `append`.           |
+| `force_restart`             | `true` to ignore `migration_state.json` and start fresh.                       |
+| `export_format` / `import_format` | `sql` or `csv`.                                                                |
+| `import_filepath`           | Full path to the file for the `import` action.                                 |
+
+## State Management and Resumption
+
+The script automatically saves its progress in `migration_state.json`. If a migration is interrupted, simply restart the script.
+-   **Interactive Mode**: You will be prompted to resume.
+-   **Headless Mode**: Resumption is automatic unless `"force_restart": true` is set in your config file.

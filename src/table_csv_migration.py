@@ -2235,7 +2235,19 @@ def main():
             headless_action = None
 
         action = headless_config.get('action', 'migrate')
-        if action == 'export':
+
+        if action == 'merge':
+            source_tables = headless_config.get('source_tables')
+            dest_table = headless_config.get('dest_table')
+            if not source_tables or not isinstance(source_tables, list) or not dest_table:
+                print("Error: 'source_tables' (as a list) and 'dest_table' are required for merge action in headless mode.")
+                logger.error("Headless merge config missing 'source_tables' or 'dest_table'.")
+                sys.exit(1)
+            
+            dest_table_with_suffix = dest_table if dest_table.endswith(suffix) else f"{dest_table}{suffix}"
+            run_multi_table_merge_migration(source_tables, dest_table_with_suffix, state, suffix, use_multithreading=use_mt, num_threads=num_threads, headless_action=headless_action)
+
+        elif action == 'export':
             export_format = headless_config.get('export_format', 'csv')
             run_export_only(tables, suffix, export_format)
         elif action == 'import':
@@ -2246,7 +2258,7 @@ def main():
                 print("Error: import_filepath is required for import action in headless mode.")
                 sys.exit(1)
             run_import_only(import_format, import_filepath, target_table, use_mt, num_threads, headless_action)
-        else:
+        elif action == 'migrate':
             skip_extract_cfg = headless_config.get('skip_extract', None)
             headless_skip = None
             if skip_extract_cfg is True:
@@ -2254,6 +2266,10 @@ def main():
             elif skip_extract_cfg is False:
                 headless_skip = 'n'
             run_migration(tables, state, suffix, use_multithreading=use_mt, num_threads=num_threads, headless_skip_extract=headless_skip, headless_action=headless_action)
+        else:
+            print(f"Error: Unknown action '{action}' in headless configuration.")
+            logger.error("Unknown headless action: %s", action)
+            sys.exit(1)
         sys.exit(0)
 
     while True:

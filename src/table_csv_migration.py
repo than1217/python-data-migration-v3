@@ -1439,6 +1439,121 @@ def run_view_to_table_migration(view_name, dest_table_name, state, suffix, use_m
         write_summary_csv(summary_csv_path, summary_data)
         logger.info("View migration summary for '%s' generated with status: %s", dest_table_name, remarks)
 
+def run_multi_table_merge_migration(source_tables, dest_table_name, state, suffix, use_multithreading=False, num_threads=4, headless_action=None):
+    """Orchestrates migrating and merging multiple source tables/views into a single destination table."""
+    t_start_total = time.time()
+    logger.info("Starting multi-table merge to destination '%s' from sources: %s", dest_table_name, ', '.join(source_tables))
+    print(f"\nStarting multi-table merge into '{dest_table_name}'.")
+    
+    folder_name = suffix.strip('_') if suffix else 'v2'
+    project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    processed_dir = os.path.join(project_dir, "output", "processed", folder_name)
+    csv_dir = os.path.join(project_dir, "output", "csv", folder_name)
+    os.makedirs(processed_dir, exist_ok=True)
+    os.makedirs(csv_dir, exist_ok=True)
+
+    summary_csv_path = os.path.join(project_dir, "output", f"migration_summary_{folder_name}.csv")
+    processed_schema = os.path.join(processed_dir, f"{dest_table_name}_schema.sql")
+
+    # --- Step 1: Handle Destination Table Setup ---
+    proceed, action, _ = check_and_handle_existing_table(dest_table_name, headless_action=headless_action)
+    if not proceed:
+        logger.warning("Merge migration for '%s' cancelled by user at table setup.", dest_table_name)
+        return
+
+    first_source_table = source_tables[0]
+    schema_generated = False
+    
+    if action in ['drop', 'truncate'] or not os.path.exists(processed_schema):
+        # We need to generate and execute a schema
+        if action == 'truncate':
+            logger.info("Destination table '%s' truncated. Schema will not be regenerated unless missing.", dest_table_name)
+        else: # drop or doesn't exist
+            logger.info("Generating schema for '%s' based on first source table '%s'", dest_table_name, first_source_table)
+            print(f"Generating schema for '{dest_table_name}' based on '{first_source_table}'...")
+            
+            # Check if first source is a view or table
+            conn_source_check = get_db_connection(host=config.DB_HOST, database=config.DB_DATABASE, user=config.DB_USER, password=config.DB_PASSWORD)
+            cursor_check = conn_source_check.cursor()
+            cursor_check.execute(f"SELECT TABLE_TYPE FROM information_schema.tables WHERE table_schema = '{config.DB_DATABASE}' AND table_name = '{first_source_table}'")
+            table_type_result = cursor_check.fetchone()
+            is_view = table_type_result and table_type_result[0].upper() == 'VIEW'
+            cursor_check.close()
+            conn_source_check.close()
+
+            schema_content = None
+            if is_view:
+                schema_content = get_view_ddl(first_source_table, dest_table_name)
+            else:
+                raw_schema_path = os.path.join(processed_dir, f"{first_source_table}_raw_schema_for_merge.sql")
+                if run_mysqldump_schema(first_source_table, raw_schema_path):
+                    # We need to process this schema file to create the final processed_schema
+                    if process_schema_file(raw_schema_path, processed_schema, first_source_table, suffix):
+                         with open(processed_schema, 'r', encoding='utf-8') as f:
+                             schema_content = f.read()
+                    os.remove(raw_schema_path) # Clean up raw schema
+
+            if schema_content:
+                with open(processed_schema, 'w', encoding='utf-8') as f:
+                    f.write(schema_content)
+                if not load_sql_schema(processed_schema):
+                    logger.error("Failed to execute schema for destination table '%s'. Aborting merge.", dest_table_name)
+                    print(f"Error: Failed to create destination table '{dest_table_name}'. Check logs.")
+                    return
+                schema_generated = True
+            else:
+                logger.error("Failed to generate DDL for '%s'. Aborting merge.", first_source_table)
+                print(f"Error: Failed to generate schema from '{first_source_table}'. Check logs.")
+                return
+
+    # --- Step 2: Iterate and Load Each Source Table ---
+    total_rows_merged = 0
+    all_successful = True
+
+    for i, source_table in enumerate(tqdm(source_tables, desc="Merging Tables", unit="table")):
+        t_start_source = time.time()
+        logger.info("Processing source table %d/%d: '%s'", i + 1, len(source_tables), source_table)
+        
+        # Unique CSV for each source table to prevent conflicts
+        csv_file = os.path.join(csv_dir, f"{source_table}_for_{dest_table_name}.csv")
+        
+        print(f"\nExporting '{source_table}' to CSV...")
+        export_success, rows_exported = export_data_to_csv(source_table, csv_file)
+        
+        if not export_success:
+            logger.error("Failed to export '%s' to CSV. Skipping this table.", source_table)
+            print(f"Error exporting '{source_table}'. Skipping.")
+            all_successful = False
+            continue
+
+        print(f"Loading data from '{source_table}' into '{dest_table_name}'...")
+        # For multi-table merge, we create a temporary state for each load, as resuming a multi-file append is complex.
+        temp_state_for_load = {"csv_load_progress": {}}
+        if load_csv_to_dest(dest_table_name, csv_file, temp_state_for_load, use_multithreading, num_threads):
+            rows_loaded = temp_state_for_load.get("csv_load_progress", {}).get(dest_table_name, {}).get("rows_loaded", 0)
+            total_rows_merged += rows_loaded
+            logger.info("Successfully merged '%s' (%d rows) in %s.", source_table, rows_loaded, format_time(time.time() - t_start_source))
+            print(f"Successfully loaded {rows_loaded} rows from '{source_table}'.")
+        else:
+            logger.error("Failed to load data from '%s' into '%s'.", source_table, dest_table_name)
+            print(f"Error loading data from '{source_table}'.")
+            all_successful = False
+        
+        # Clean up the CSV for this source table after processing
+        if os.path.exists(csv_file):
+            os.remove(csv_file)
+
+    # --- Step 3: Finalize and Summarize ---
+    elapsed_total_str = format_time(time.time() - t_start_total)
+    remarks = "Success" if all_successful else "Partial Success"
+    
+    print(f"\nMulti-table merge completed in {elapsed_total_str}. Total rows merged: {total_rows_merged}.")
+    logger.info("Multi-table merge for '%s' finished. Total rows: %d. Status: %s", dest_table_name, total_rows_merged, remarks)
+
+    ddl_content = get_ddl_content(processed_schema) if schema_generated else "-- Schema not generated in this run --"
+    summary_data = [[dest_table_name, elapsed_total_str, ddl_content, total_rows_merged, f"Merge ({remarks})"]]
+    write_summary_csv(summary_csv_path, summary_data)
+
 def run_migration(tables, state, suffix, use_multithreading=False, num_threads=4, headless_skip_extract=None, headless_action=None):
     folder_name = suffix.strip('_') if suffix else 'v2'
 
@@ -1918,22 +2033,23 @@ def migration_menu(suffix, servers):
         print("1. Specify table name pattern (Regular Expression)")
         print("2. Specify exact table names (Comma-separated list)")
         print("3. Migrate from View to Table")
-        print("4. Export Schema and Data only (Download)")
-        print("5. Import Schema or Data from file (Upload)")
-        print("6. Exit / Back to main menu")
+        print("4. Merge Multiple Tables/Views into One")
+        print("5. Export Schema and Data only (Download)")
+        print("6. Import Schema or Data from file (Upload)")
+        print("7. Exit / Back to main menu")
         print("=============================================")
         
-        choice = input("Select an option (1-6): ").strip()
+        choice = input("Select an option (1-7): ").strip()
         
-        if choice == '6':
+        if choice == '7':
             break
 
-        if choice not in ['1', '2', '3', '4', '5']:
+        if choice not in ['1', '2', '3', '4', '5', '6']:
             print("Invalid choice.")
             continue
 
-        needs_source = choice in ['1', '2', '3', '4']
-        needs_dest = choice in ['1', '2', '3', '5']
+        needs_source = choice in ['1', '2', '3', '4', '5']
+        needs_dest = choice in ['1', '2', '3', '4', '6']
 
         if needs_source and not source_connected:
             if not setup_source_connection(servers, suffix):
@@ -1998,8 +2114,23 @@ def migration_menu(suffix, servers):
             
             use_mt, num_threads = ask_multithreading()
             run_view_to_table_migration(view_name, dest_table_with_suffix, state, suffix, use_multithreading=use_mt, num_threads=num_threads)
-            
+
         elif choice == '4':
+            tables_input = input("Enter source tables/views separated by commas: ").strip()
+            if not tables_input: continue
+            source_tables = [t.strip() for t in tables_input.split(',')]
+            
+            dest_table_name = input(f"Enter single destination table name: ").strip()
+            if not dest_table_name: continue
+            
+            dest_table_with_suffix = dest_table_name if dest_table_name.endswith(suffix) else f"{dest_table_name}{suffix}"
+            print(f"The destination table will be named: {dest_table_with_suffix}")
+            
+            state = load_state() # We don't use state for resuming this kind of merge, but we load it for other functions.
+            use_mt, num_threads = ask_multithreading()
+            run_multi_table_merge_migration(source_tables, dest_table_with_suffix, state, suffix, use_multithreading=use_mt, num_threads=num_threads)
+            
+        elif choice == '5':
             print("\n--- Export Only ---")
             print("1. Specify pattern")
             print("2. Specify exact table names")
@@ -2017,7 +2148,7 @@ def migration_menu(suffix, servers):
                 tables = get_lib_tables(from_list=table_list)
                 run_export_only(tables, suffix, export_format)
                 
-        elif choice == '5':
+        elif choice == '6':
             print("\n--- Import Data ---")
             print("1. Import SQL File")
             print("2. Import CSV File")

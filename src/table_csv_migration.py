@@ -503,19 +503,32 @@ def export_data_to_csv(table_name, csv_file_path):
                             else:
                                 logger.info("Table '%s' appears empty. Exporting headers only.", table_name)
                     
-                    # Strategy 2: View with unbuffered streaming chosen
+                    # Strategy 2: View with unbuffered streaming chosen, with fallback
                     if strategy == 'unbuffered_stream':
-                        logger.info("'%s' is a view. Using unbuffered streaming export.", table_name)
-                        with conn.cursor(buffered=False) as unbuffered_cursor:
-                            unbuffered_cursor.execute(f"SELECT * FROM `{table_name}`")
-                            while True:
-                                rows = unbuffered_cursor.fetchmany(50000)
-                                if not rows:
-                                    break
-                                writer.writerows(rows)
-                                rows_fetched = len(rows)
-                                exact_row_count += rows_fetched
-                                pbar.update(rows_fetched)
+                        try:
+                            logger.info("Attempting unbuffered streaming export for view '%s'.", table_name)
+                            with conn.cursor(buffered=False) as unbuffered_cursor:
+                                unbuffered_cursor.execute(f"SELECT * FROM `{table_name}`")
+                                while True:
+                                    rows = unbuffered_cursor.fetchmany(50000)
+                                    if not rows:
+                                        break
+                                    writer.writerows(rows)
+                                    rows_fetched = len(rows)
+                                    exact_row_count += rows_fetched
+                                    pbar.update(rows_fetched)
+                            strategy = 'completed' # Mark as done to skip pagination
+                        except Error as view_error:
+                            logger.warning("Unbuffered streaming for view '%s' failed: %s. Falling back to pagination.", table_name, view_error)
+                            print(f"\nUnbuffered streaming failed for '{table_name}'. Falling back to safer pagination method...")
+                            
+                            # Reset file, row count, and progress bar for pagination attempt
+                            f.seek(0)
+                            f.truncate()
+                            writer.writerow(headers)
+                            exact_row_count = 0
+                            pbar.reset()
+                            strategy = 'pagination'
                     
                     # Strategy 3: Fallback Pagination for tables without a PK, for views where user selected it, or if PK chunking failed
                     if strategy == 'pagination':

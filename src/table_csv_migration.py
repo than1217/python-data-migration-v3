@@ -1768,7 +1768,7 @@ def run_migration(tables, state, suffix, use_multithreading=False, num_threads=4
     
     if successful_migrations == len(tables):
         logger.info("All tables migrated successfully. Resetting migration state.")
-        save_state({"processed_tables": [], "migrated_tables": [], "pattern": None, "from_list": None})
+        save_state({"processed_tables": [], "migrated_tables": [], "pattern": None, "from_list": None, "csv_load_progress": {}, "final_row_counts": {}})
 
     elapsed_time = time.time() - start_time
     m, s = divmod(elapsed_time, 60)
@@ -2097,7 +2097,7 @@ def migration_menu(suffix, servers):
             if state.get("migrated_tables") or state.get("csv_load_progress"):
                 resume = input("\nExisting migration progress found. Resume? (y/n): ").strip().lower()
                 if resume != 'y':
-                    state = {"migrated_tables": [], "csv_load_progress": {}, "final_row_counts": {}}
+                    state = {"processed_tables": [], "migrated_tables": [], "pattern": None, "from_list": None, "csv_load_progress": {}, "final_row_counts": {}}
                     save_state(state)
             use_mt, num_threads = ask_multithreading()
             tables = get_lib_tables(from_list=table_list)
@@ -2227,7 +2227,7 @@ def main():
         
         state = load_state()
         if headless_config.get('force_restart', False):
-            state = {"migrated_tables": [], "csv_load_progress": {}, "final_row_counts": {}}
+            state = {"processed_tables": [], "migrated_tables": [], "pattern": None, "from_list": None, "csv_load_progress": {}, "final_row_counts": {}}
             save_state(state)
         elif state.get("migrated_tables") or state.get("csv_load_progress"):
             logger.info("Existing migration state found. Resuming headless migration.")

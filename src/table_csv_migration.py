@@ -391,8 +391,8 @@ def export_data_to_csv(table_name, csv_file_path):
                 cursor.execute("SET SESSION wait_timeout=10800")
                 if mysql_version >= (5, 7, 0):
                     cursor.execute("SET SESSION MAX_EXECUTION_TIME=0")
-            except Error:
-                pass
+            except Error as e:
+                logger.warning("Could not set session timeouts for data export: %s", e)
 
             # Determine if it's a table or a view
             cursor.execute(f"SELECT TABLE_TYPE FROM information_schema.tables WHERE table_schema = '{config.DB_DATABASE}' AND table_name = '{table_name}'")
@@ -535,7 +535,7 @@ def export_data_to_csv(table_name, csv_file_path):
                         if not is_view:
                             logger.warning("No suitable single-column integer PK found for '%s'. Using LIMIT/OFFSET pagination.", table_name)
                         
-                        chunk_size = 500000
+                        chunk_size = 75000  # Reduced chunk size for safety on slow views/tables
                         offset = 0
                         while True:
                             with conn.cursor(buffered=True) as chunk_cursor:

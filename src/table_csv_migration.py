@@ -364,7 +364,7 @@ def process_schema_file(input_file, output_file, table_name, suffix):
         logger.error("Error processing schema dump file for '%s': %s", table_name, e)
         return False
 
-def export_data_to_csv(table_name, csv_file_path):
+def export_data_to_csv(table_name, csv_file_path, view_export_strategy=None):
     """Exports data directly to a CSV file using python streaming with utf8mb4 charset.
        Uses Primary Key chunking (pagination) to prevent memory spikes and query timeouts on large tables."""
     logger.info("Exporting data from '%s' to CSV...", table_name)
@@ -452,13 +452,17 @@ def export_data_to_csv(table_name, csv_file_path):
                 # --- Decide on the export strategy ---
                 strategy = None
                 if is_view:
-                    choice = input("\nDetected a VIEW. Choose export method:\n  (1) Unbuffered Streaming (default, faster if it works, might hang on complex views)\n  (2) Pagination (slower but safer, use if streaming hangs)\nChoice [1]: ").strip()
-                    if choice == '2':
-                        strategy = 'pagination'
-                        logger.info("User selected Pagination for view '%s'.", table_name)
+                    if view_export_strategy in ['pagination', 'unbuffered_stream']:
+                        strategy = view_export_strategy
+                        logger.info("Using pre-selected strategy '%s' for view '%s'.", strategy, table_name)
                     else:
-                        strategy = 'unbuffered_stream'
-                        logger.info("User selected Unbuffered Streaming for view '%s'.", table_name)
+                        choice = input("\nDetected a VIEW. Choose export method:\n  (1) Unbuffered Streaming (default, faster if it works, might hang on complex views)\n  (2) Pagination (slower but safer, use if streaming hangs)\nChoice [1]: ").strip()
+                        if choice == '2':
+                            strategy = 'pagination'
+                            logger.info("User selected Pagination for view '%s'.", table_name)
+                        else:
+                            strategy = 'unbuffered_stream'
+                            logger.info("User selected Unbuffered Streaming for view '%s'.", table_name)
                 else: # It's a table
                     if pk_col_name:
                         strategy = 'pk_chunk'
@@ -1519,6 +1523,29 @@ def run_multi_table_merge_migration(source_tables, dest_table_name, state, suffi
                 print(f"Error: Failed to generate schema from '{first_source_table}'. Check logs.")
                 return
 
+    # --- Step 1.5: Ask for view export strategy if needed ---
+    conn_source_check = get_db_connection(host=config.DB_HOST, database=config.DB_DATABASE, user=config.DB_USER, password=config.DB_PASSWORD)
+    cursor_check = conn_source_check.cursor()
+    any_views = False
+    for table in source_tables:
+        cursor_check.execute(f"SELECT TABLE_TYPE FROM information_schema.tables WHERE table_schema = '{config.DB_DATABASE}' AND table_name = '{table}'")
+        result = cursor_check.fetchone()
+        if result and result[0].upper() == 'VIEW':
+            any_views = True
+            break
+    cursor_check.close()
+    conn_source_check.close()
+
+    view_export_strategy = None
+    if any_views:
+        choice = input("\nDetected one or more VIEWs. Choose a single export method for ALL views:\n  (1) Unbuffered Streaming (default, faster, might hang on complex views)\n  (2) Pagination (slower but safer)\nChoice [1]: ").strip()
+        if choice == '2':
+            view_export_strategy = 'pagination'
+            logger.info("User selected Pagination for all views in the merge operation.")
+        else:
+            view_export_strategy = 'unbuffered_stream'
+            logger.info("User selected Unbuffered Streaming for all views in the merge operation.")
+
     # --- Step 2: Iterate and Load Each Source Table ---
     total_rows_merged = 0
     all_successful = True
@@ -1531,7 +1558,7 @@ def run_multi_table_merge_migration(source_tables, dest_table_name, state, suffi
         csv_file = os.path.join(csv_dir, f"{source_table}_for_{dest_table_name}.csv")
         
         print(f"\nExporting '{source_table}' to CSV...")
-        export_success, rows_exported = export_data_to_csv(source_table, csv_file)
+        export_success, rows_exported = export_data_to_csv(source_table, csv_file, view_export_strategy=view_export_strategy)
         
         if not export_success:
             logger.error("Failed to export '%s' to CSV. Skipping this table.", source_table)

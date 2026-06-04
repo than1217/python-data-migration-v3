@@ -17,6 +17,8 @@ from mysql.connector import Error
 import config
 import socket
 
+GLOBAL_VIEW_EXPORT_STRATEGY = None
+
 # Set up logging to migration.log
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 log_file = os.path.join(base_dir, "migration.log")
@@ -451,18 +453,23 @@ def export_data_to_csv(table_name, csv_file_path, view_export_strategy=None):
 
                 # --- Decide on the export strategy ---
                 strategy = None
+                global GLOBAL_VIEW_EXPORT_STRATEGY
                 if is_view:
                     if view_export_strategy in ['pagination', 'unbuffered_stream']:
                         strategy = view_export_strategy
                         logger.info("Using pre-selected strategy '%s' for view '%s'.", strategy, table_name)
+                    elif GLOBAL_VIEW_EXPORT_STRATEGY in ['pagination', 'unbuffered_stream']:
+                        strategy = GLOBAL_VIEW_EXPORT_STRATEGY
+                        logger.info("Using global strategy '%s' for view '%s'.", strategy, table_name)
                     else:
-                        choice = input("\nDetected a VIEW. Choose export method:\n  (1) Unbuffered Streaming (default, faster if it works, might hang on complex views)\n  (2) Pagination (slower but safer, use if streaming hangs)\nChoice [1]: ").strip()
-                        if choice == '2':
-                            strategy = 'pagination'
-                            logger.info("User selected Pagination for view '%s'.", table_name)
-                        else:
+                        choice = input(f"\nDetected VIEW '{table_name}'. Choose export method (applies to all subsequent views):\n  (1) Unbuffered Streaming (faster, but may hang on complex views)\n  (2) Pagination (safer, default)\nChoice [2]: ").strip()
+                        if choice == '1':
                             strategy = 'unbuffered_stream'
                             logger.info("User selected Unbuffered Streaming for view '%s'.", table_name)
+                        else:
+                            strategy = 'pagination'
+                            logger.info("User selected Pagination for view '%s'.", table_name)
+                        GLOBAL_VIEW_EXPORT_STRATEGY = strategy
                 else: # It's a table
                     if pk_col_name:
                         strategy = 'pk_chunk'
@@ -1523,28 +1530,8 @@ def run_multi_table_merge_migration(source_tables, dest_table_name, state, suffi
                 print(f"Error: Failed to generate schema from '{first_source_table}'. Check logs.")
                 return
 
-    # --- Step 1.5: Ask for view export strategy if needed ---
-    conn_source_check = get_db_connection(host=config.DB_HOST, database=config.DB_DATABASE, user=config.DB_USER, password=config.DB_PASSWORD)
-    cursor_check = conn_source_check.cursor()
-    any_views = False
-    for table in source_tables:
-        cursor_check.execute(f"SELECT TABLE_TYPE FROM information_schema.tables WHERE table_schema = '{config.DB_DATABASE}' AND table_name = '{table}'")
-        result = cursor_check.fetchone()
-        if result and result[0].upper() == 'VIEW':
-            any_views = True
-            break
-    cursor_check.close()
-    conn_source_check.close()
-
+    # --- Step 1.5: (Removed) View export strategy is now handled globally in export_data_to_csv ---
     view_export_strategy = None
-    if any_views:
-        choice = input("\nDetected one or more VIEWs. Choose a single export method for ALL views:\n  (1) Unbuffered Streaming (default, faster, might hang on complex views)\n  (2) Pagination (slower but safer)\nChoice [1]: ").strip()
-        if choice == '2':
-            view_export_strategy = 'pagination'
-            logger.info("User selected Pagination for all views in the merge operation.")
-        else:
-            view_export_strategy = 'unbuffered_stream'
-            logger.info("User selected Unbuffered Streaming for all views in the merge operation.")
 
     # --- Step 2: Iterate and Load Each Source Table ---
     total_rows_merged = 0
@@ -2060,8 +2047,10 @@ def ask_multithreading():
 def migration_menu(suffix, servers):
     source_connected = False
     dest_connected = False
+    global GLOBAL_VIEW_EXPORT_STRATEGY
 
     while True:
+        GLOBAL_VIEW_EXPORT_STRATEGY = None
         print("\n=============================================")
         print("    CSV MIGRATION OPTIONS")
         if source_connected and hasattr(config, 'DB_DATABASE'):
@@ -2211,7 +2200,7 @@ def migration_menu(suffix, servers):
             if drop_trigs != 'n' and target_table:
                  _drop_triggers_for_table(target_table)
                 
-            run_import_only(import_format, filepath, target_table, use_mt, num_threads)
+            run_import_only(import_format, filepath, target_table, use_mt, num_threads, headless_action)
 
 def main():
     parser = argparse.ArgumentParser(description="Python CSV Data Migration Utility")

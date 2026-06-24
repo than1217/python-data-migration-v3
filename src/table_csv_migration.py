@@ -2200,7 +2200,7 @@ def migration_menu(suffix, servers):
             if drop_trigs != 'n' and target_table:
                  _drop_triggers_for_table(target_table)
                 
-            run_import_only(import_format, filepath, target_table, use_mt, num_threads, headless_action)
+            run_import_only(import_format, filepath, target_table, use_mt, num_threads, headless_action=None)
 
 def main():
     parser = argparse.ArgumentParser(description="Python CSV Data Migration Utility")

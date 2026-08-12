@@ -506,7 +506,7 @@ def export_data_to_csv(table_name, csv_file_path, view_export_strategy=None):
                                         while True:
                                             rows = unbuffered_cursor.fetchmany(50000)
                                             if not rows: break
-                                            writer.writerows(rows)
+                                            writer.writerows([tuple('NULL' if val is None else val for val in row) for row in rows])
                                             rows_in_chunk += len(rows)
                                         exact_row_count += rows_in_chunk
                                         pbar.update(rows_in_chunk)
@@ -524,7 +524,7 @@ def export_data_to_csv(table_name, csv_file_path, view_export_strategy=None):
                                     rows = unbuffered_cursor.fetchmany(50000)
                                     if not rows:
                                         break
-                                    writer.writerows(rows)
+                                    writer.writerows([tuple('NULL' if val is None else val for val in row) for row in rows])
                                     rows_fetched = len(rows)
                                     exact_row_count += rows_fetched
                                     pbar.update(rows_fetched)
@@ -555,7 +555,7 @@ def export_data_to_csv(table_name, csv_file_path, view_export_strategy=None):
                                 rows = chunk_cursor.fetchall()
                                 if not rows:
                                     break
-                                writer.writerows(rows)
+                                writer.writerows([tuple('NULL' if val is None else val for val in row) for row in rows])
                                 rows_fetched = len(rows)
                                 exact_row_count += rows_fetched
                                 pbar.update(rows_fetched)
@@ -796,7 +796,7 @@ def _execute_fallback_insert(target_table_name, headers, rows):
             batch_size = 5000
             batch = []
             for row in rows:
-                batch.append(tuple(row))
+                batch.append(tuple(None if val == 'NULL' else val for val in row))
                 if len(batch) >= batch_size:
                     cursor.executemany(query, batch)
                     conn.commit()
